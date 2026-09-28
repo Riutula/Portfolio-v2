@@ -45,8 +45,7 @@ TYPE_LABELS = {
 }
 SECTOR_OVERRIDES = {
     'TPXE.PA': 'TOPIX index',
-    '0P00000BKL': 'Short Term Money Market',
-    'CRM' : 'Information Technology'
+    '0P00000BKL': 'Short Term Money Market'
 }
 
 
