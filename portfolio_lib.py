@@ -45,7 +45,7 @@ TYPE_LABELS = {
 }
 SECTOR_OVERRIDES = {
     'TPXE.PA': 'TOPIX index',
-    '0P00000BKL': 'Short Term Money Market'
+    '0P00000BKL': 'Short Term Money Market',
 }
 
 
@@ -59,6 +59,21 @@ def _to_series(x):
     if isinstance(x, pd.DataFrame):
         return x.iloc[:, 0]
     return x
+
+
+def detect_currency(ticker):
+    """Best-effort currency detection for a ticker not in DEFAULT_CURRENCY_MAP
+    (i.e. one the user typed in manually), via yfinance metadata. Falls back
+    to 'USD' if detection fails - the price will still load, just make sure
+    to sanity-check the FX conversion for that ticker if it's wrong."""
+    try:
+        info = yf.Ticker(ticker).info
+        ccy = info.get('currency')
+        if ccy:
+            return ccy.upper()
+    except Exception:
+        pass
+    return 'USD'
 
 
 def load_fx_data(currencies, start_date, end_date):
