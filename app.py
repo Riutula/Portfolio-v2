@@ -60,6 +60,13 @@ def cached_asset_info(tickers):
     return lib.get_asset_info(tickers)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_detect_currencies(tickers):
+    """Best-effort currency detection for tickers the user typed in manually
+    (not part of DEFAULT_CURRENCY_MAP)."""
+    return {t: lib.detect_currency(t) for t in tickers}
+
+
 @st.cache_data(ttl=3600, show_spinner="Building the composite benchmark...")
 def cached_benchmark(weights_series, currency_map, start_date, end_date):
     return lib.build_benchmark_composite(weights_series, currency_map, start_date, end_date)
@@ -118,9 +125,22 @@ st.sidebar.title("Settings")
 
 tickers = st.sidebar.multiselect(
     "Universe", options=lib.DEFAULT_TICKERS, default=lib.DEFAULT_TICKERS,
-    help="Remove a ticker to exclude it from every calculation on this page.",
+    accept_new_options=True,
+    help="Remove a ticker to exclude it, or type any other Yahoo Finance ticker to add it "
+         "(e.g. AAPL, VOD.L, 7203.T).",
 )
-currency_map = {t: lib.DEFAULT_CURRENCY_MAP[t] for t in tickers}
+
+_custom_tickers = tuple(sorted(t for t in tickers if t not in lib.DEFAULT_CURRENCY_MAP))
+if _custom_tickers:
+    with st.sidebar.spinner(f"Detecting currency for {', '.join(_custom_tickers)}..."):
+        _detected_currencies = cached_detect_currencies(_custom_tickers)
+else:
+    _detected_currencies = {}
+
+currency_map = {
+    t: lib.DEFAULT_CURRENCY_MAP.get(t, _detected_currencies.get(t, "USD"))
+    for t in tickers
+}
 
 today = datetime.today()
 MIN_DATE = datetime(2025, 6, 27)
@@ -165,6 +185,14 @@ try:
 except Exception as e:
     st.error(f"Could not download price data: {e}")
     st.stop()
+
+_empty_tickers = [t for t in prices.columns if prices[t].dropna().empty]
+if _empty_tickers:
+    st.warning(
+        f"No price data found for: {', '.join(_empty_tickers)}. Check the ticker spelling on "
+        f"Yahoo Finance (finance.yahoo.com) - they were kept in the universe but will show as "
+        f"blank/zero everywhere below."
+    )
 
 returns = lib.compute_returns(prices)
 summary_stats = lib.compute_summary_stats(returns)
