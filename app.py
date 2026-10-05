@@ -155,13 +155,6 @@ else:
     start_date, end_date = default_start, today
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Out-of-sample rolling window")
-window_size = st.sidebar.slider("Lookback window (trading days)", 60, 252, 252, step=1,
-                                 help="History used to re-optimize the Mean-Variance portfolio at each rebalance.")
-rebalance_freq = st.sidebar.slider("Rebalance frequency (trading days)", 5, 252, 21, step=1,
-                                    help="21 trading days ≈ 1 month. 252 ≈ 1 year (i.e. no rebalancing within the period).")
-
-st.sidebar.markdown("---")
 run_button = st.sidebar.button("Run / refresh analysis", type="primary", use_container_width=True)
 
 if not tickers:
@@ -289,7 +282,16 @@ with tab_construction:
 # Tab 3: Out-of-sample rolling window
 # ---------------------------------------------------------------------
 with tab_oos:
-    st.subheader(f"Out-of-sample rolling window (lookback={window_size}d, rebalance every {rebalance_freq}d)")
+    st.subheader("Out-of-sample rolling window")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        window_size = st.slider("Lookback window (trading days)", 60, 252, 252, step=1,
+                                 help="History used to re-optimize the Mean-Variance portfolio at each rebalance.")
+    with c2:
+        rebalance_freq = st.slider("Rebalance frequency (trading days)", 5, 252, 21, step=1,
+                                    help="21 trading days ≈ 1 month. 252 ≈ 1 year (i.e. no rebalancing within the period).")
+    st.caption(f"Current setting: lookback = {window_size}d, rebalance every {rebalance_freq}d.")
 
     rw_mv, oos_mv, rw_eq, oos_eq, rw_minvar, oos_minvar = cached_rolling(returns, risk_free_daily, window_size, rebalance_freq)
 
