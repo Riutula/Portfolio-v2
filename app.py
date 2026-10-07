@@ -734,6 +734,24 @@ with tab_client:
                                  title="Combined portfolio weights")
                     st.plotly_chart(fig, use_container_width=True)
 
+                st.markdown("### Diversification")
+                c1, c2 = st.columns(2)
+                with c1:
+                    sector_w = {}
+                    for t, w in combined_weights.items():
+                        s = asset_info.loc[t, "Sector"] if t in asset_info.index else "Not classified"
+                        s = s if s and s != "-" else "Not classified"
+                        sector_w[s] = sector_w.get(s, 0.0) + w
+                    fig = px.pie(values=list(sector_w.values()), names=list(sector_w.keys()), title="By sector")
+                    st.plotly_chart(fig, use_container_width=True)
+                with c2:
+                    ccy_w = {}
+                    for t, w in combined_weights.items():
+                        c = currency_map.get(t, "Not classified")
+                        ccy_w[c] = ccy_w.get(c, 0.0) + w
+                    fig = px.pie(values=list(ccy_w.values()), names=list(ccy_w.keys()), title="By currency")
+                    st.plotly_chart(fig, use_container_width=True)
+
                 common_idx = oos_mv_final.index.intersection(oos_minvar_final.index)
                 if len(common_idx) > 5:
                     combined_oos = (w_minvar_ratio * oos_minvar_final.loc[common_idx]
