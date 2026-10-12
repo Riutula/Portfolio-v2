@@ -225,6 +225,21 @@ with tab_assets:
         fmt_stats[c] = fmt_stats[c].map(pct)
     st.dataframe(fmt_stats, use_container_width=True)
 
+    st.subheader("Correlation matrix")
+    corr_matrix = lib.compute_correlation_matrix(returns, asset_info["Name"].to_dict())
+    if corr_matrix.shape[0] < 2:
+        st.info("Select at least 2 assets with price data to display a correlation matrix.")
+    else:
+        fig = px.imshow(
+            corr_matrix, color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+            text_auto=".2f", aspect="auto",
+        )
+        fig.update_layout(height=max(500, 45 * corr_matrix.shape[0]),
+                          coloraxis_colorbar=dict(title="Correlation"))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Pearson correlation of daily returns (in CHF) over the selected period. "
+                   "Lower correlation between two assets means better diversification between them.")
+
 # ---------------------------------------------------------------------
 # Tab 2: Portfolio Construction (in-sample)
 # ---------------------------------------------------------------------
