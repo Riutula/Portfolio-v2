@@ -169,6 +169,20 @@ def compute_summary_stats(returns):
     return out
 
 
+def compute_correlation_matrix(returns, labels=None):
+    """Pearson correlation matrix of daily returns. Assets with no return
+    data at all (e.g. a mistyped ticker) are dropped rather than producing a
+    row/column of NaN. `labels` optionally maps ticker -> display name, used
+    to relabel both axes (e.g. real security names instead of tickers)."""
+    clean = returns.dropna(axis=1, how="all")
+    corr = clean.corr()
+    if labels:
+        names = [labels.get(t, t) for t in corr.columns]
+        corr.index = names
+        corr.columns = names
+    return corr
+
+
 # ---------------------------------------------------------------------
 # Portfolio construction (in-sample)
 # ---------------------------------------------------------------------
