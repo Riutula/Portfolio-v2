@@ -20,13 +20,13 @@ from scipy.optimize import minimize
 
 DEFAULT_TICKERS = [
     'CRM', 'HOLN.SW', 'LLY', 'NESN.SW', 'CTPNV.AS', '5JS.SI',
-    'AMRZ', 'ASCN.SW', 'TPXE.PA', 'ECL', 'HYG', '0P00000BKL','LU2573967036-USD.LU'
+    'AMRZ', 'ASCN.SW', 'TPXE.PA', 'ECL', 'HYG', '0P00000BKL','LU2573967036-USD.LU', 'DGE.L'
 ]
 
 DEFAULT_CURRENCY_MAP = {
     'CRM': 'USD', 'HOLN.SW': 'CHF', 'LLY': 'USD', 'NESN.SW': 'CHF',
     'CTPNV.AS': 'EUR', '5JS.SI': 'SGD', 'AMRZ': 'USD', 'ASCN.SW': 'CHF',
-    'TPXE.PA': 'EUR', 'ECL': 'USD', 'HYG': 'USD', '0P00000BKL': 'USD','LU2573967036-USD.LU' : 'USD'
+    'TPXE.PA': 'EUR', 'ECL': 'USD', 'HYG': 'USD', '0P00000BKL': 'USD','LU2573967036-USD.LU' : 'USD', 'DGE.L' : 'GBp'
 }
 
 BENCHMARK_BY_CURRENCY = {
