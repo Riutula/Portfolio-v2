@@ -41,12 +41,16 @@ DEFAULT_N_REBALANCE_POINTS = 5
 # every time.
 
 @st.cache_data(ttl=3600, show_spinner="Downloading prices...")
-def cached_prices(tickers, currency_map_items, start_date, end_date):
-    # currency_map_items is a tuple of (ticker, currency) pairs - Streamlit's
-    # cache needs hashable arguments, so the dict is rebuilt here.
+def cached_prices(tickers, currency_map_items, price_scale_items, start_date, end_date):
+    # currency_map_items / price_scale_items are tuples of pairs - Streamlit's
+    # cache needs hashable arguments, so the dicts are rebuilt here.
     currency_map = dict(currency_map_items)
-    fx = lib.load_fx_data(tuple(currency_map.values()), start_date, end_date)
-    prices = lib.load_prices_chf(list(tickers), currency_map, start_date, end_date, fx_data=fx)
+    price_scale = dict(price_scale_items)
+    # USD is always downloaded: MSCI World and the benchmark ETFs need USDCHF
+    # even if the user removed every USD-quoted ticker from the universe.
+    fx = lib.load_fx_data(tuple(currency_map.values()) + ("USD",), start_date, end_date)
+    prices = lib.load_prices_chf(list(tickers), currency_map, start_date, end_date,
+                                 fx_data=fx, price_scale=price_scale)
     return prices, fx
 
 
@@ -64,7 +68,7 @@ def cached_asset_info(tickers):
 def cached_detect_currencies(tickers):
     """Best-effort currency detection for tickers the user typed in manually
     (not part of DEFAULT_CURRENCY_MAP)."""
-    return {t: lib.detect_currency(t) for t in tickers}
+    return {t: lib.detect_currency_and_scale(t) for t in tickers}
 
 
 @st.cache_data(ttl=3600, show_spinner="Building the composite benchmark...")
@@ -111,6 +115,20 @@ def cached_best_params(returns, risk_free_daily, risk_free_rate, msci_returns, s
     return int(best["window_size"]), int(best["rebalance_freq"])
 
 
+@st.cache_data(ttl=3600, show_spinner="Downloading hedge fund proxies...")
+def cached_hf_data(tickers, years, today_str):
+    """Daily USD prices for the hedge fund proxies + the MSCI World benchmark."""
+    end = pd.Timestamp(today_str)
+    start = end - pd.DateOffset(years=years)
+    return lib.load_prices_usd(list(tickers) + [lib.HEDGE_FUND_BENCHMARK], start, end)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_hf_risk_free(years, today_str):
+    end = pd.Timestamp(today_str)
+    return lib.average_risk_free_rate(end - pd.DateOffset(years=years), end)
+
+
 def pct(x, d=2):
     try:
         return f"{x * 100:.{d}f}%"
@@ -138,9 +156,18 @@ else:
     _detected_currencies = {}
 
 currency_map = {
-    t: lib.DEFAULT_CURRENCY_MAP.get(t, _detected_currencies.get(t, "USD"))
+    t: lib.DEFAULT_CURRENCY_MAP.get(t, _detected_currencies.get(t, ("USD", 1.0))[0])
     for t in tickers
 }
+# Factor applied to the raw Yahoo price before FX conversion: e.g. 0.01 for a
+# London stock quoted in pence ("GBp"). Known for the default tickers, detected
+# for the ones typed in by the user.
+price_scale = {t: lib.DEFAULT_PRICE_SCALE[t] for t in tickers if t in lib.DEFAULT_PRICE_SCALE}
+price_scale.update({
+    t: _detected_currencies[t][1]
+    for t in tickers
+    if t in _detected_currencies and _detected_currencies[t][1] != 1.0
+})
 
 today = datetime.today()
 MIN_DATE = datetime(2025, 6, 27)
@@ -174,7 +201,8 @@ if not st.session_state.has_run:
 # Core pipeline (cached)
 # ---------------------------------------------------------------------
 try:
-    prices, fx_data = cached_prices(tuple(tickers), tuple(sorted(currency_map.items())), start_date, end_date)
+    prices, fx_data = cached_prices(tuple(tickers), tuple(sorted(currency_map.items())),
+                                     tuple(sorted(price_scale.items())), start_date, end_date)
 except Exception as e:
     st.error(f"Could not download price data: {e}")
     st.stop()
@@ -195,8 +223,8 @@ asset_info = cached_asset_info(tuple(tickers))
 st.title("📊 Portfolio Dashboard")
 st.caption(f"{len(tickers)} assets • base currency CHF • {start_date} → {end_date}")
 
-tab_assets, tab_construction, tab_oos, tab_optim, tab_client, tab_data = st.tabs(
-    ["Assets", "Portfolio Construction", "Out-of-Sample", "Optimization", "Client", "Raw Data"]
+tab_assets, tab_construction, tab_oos, tab_optim, tab_client, tab_hf, tab_data = st.tabs(
+    ["Assets", "Portfolio Construction", "Out-of-Sample", "Optimization", "Client", "Hedge Funds", "Raw Data"]
 )
 
 # ---------------------------------------------------------------------
@@ -804,6 +832,178 @@ with tab_client:
                         f"performance: the longer of the two lookback windows "
                         f"({longer_window} days) leaves too few trading days after it within the "
                         f"loaded price history. Widen the date range in the sidebar to see this chart."
+                    )
+
+# ---------------------------------------------------------------------
+# Tab: Hedge funds (liquid proxies, monthly analytics)
+# ---------------------------------------------------------------------
+with tab_hf:
+    st.subheader("Hedge fund strategies (liquid proxies)")
+    st.caption(
+        "Yahoo Finance does not list private hedge funds. The vehicles below are listed companies and "
+        "liquid-alternative funds that follow the same strategies, used as PROXIES: they carry their own "
+        "fees and daily liquidity, so they approximate - not replicate - the private funds. Everything is "
+        "computed on MONTHLY returns, in USD (the native currency of the proxies, which isolates strategy "
+        "behaviour from CHF FX noise), against MSCI World."
+    )
+
+    strategy_labels = dict(lib.HEDGE_FUND_PROXIES)
+    hf_tickers_raw = st.multiselect(
+        "Vehicles", options=list(strategy_labels), default=list(strategy_labels),
+        accept_new_options=True, key="hf_universe",
+        help="One liquid proxy per strategy by default. Type any other Yahoo Finance ticker to add it.",
+    )
+    hf_tickers = list(dict.fromkeys(t.strip().upper() for t in hf_tickers_raw if t.strip()))
+    hf_years = st.slider(
+        "History (years)", 3, 15, 10, key="hf_years",
+        help="The analysis uses the period common to all vehicles, so it is capped by the youngest one.",
+    )
+    if st.button("Run hedge fund analysis", type="primary", key="hf_run"):
+        st.session_state["hf_ran"] = True
+
+    if st.session_state.get("hf_ran"):
+        if not hf_tickers:
+            st.warning("Select at least one vehicle.")
+        else:
+            _today = datetime.today()
+            _today_str = _today.strftime("%Y-%m-%d")
+            hf_prices, hf_meta, hf_dropped = cached_hf_data(tuple(hf_tickers), hf_years, _today_str)
+            if hf_dropped:
+                st.warning("Excluded: " + "; ".join(f"{t} ({why})" for t, why in hf_dropped.items()))
+
+            bench_t = lib.HEDGE_FUND_BENCHMARK
+            if bench_t not in hf_prices.columns:
+                st.error("Could not download the MSCI World benchmark (URTH) - cannot compute the statistics.")
+            else:
+                monthly_all = lib.monthly_returns_from_prices(hf_prices, asof=_today)
+                first_valid = monthly_all.apply(lambda s: s.first_valid_index())
+                monthly = monthly_all.dropna(how="any")
+                usable = [t for t in hf_tickers if t in monthly.columns]
+
+                if not usable or len(monthly) < 12:
+                    st.warning(
+                        "Not enough common monthly history (at least 12 months needed). Remove the "
+                        "youngest vehicle or shorten the history."
+                    )
+                else:
+                    youngest = first_valid[usable].idxmax()
+                    st.caption(
+                        f"Common period: {monthly.index[0]:%b %Y} → {monthly.index[-1]:%b %Y} "
+                        f"({len(monthly)} months), limited by {youngest} (the youngest vehicle)."
+                    )
+
+                    bench_label = "MSCI World (URTH)"
+                    bench = monthly[bench_t]
+                    labels = {t: f"{t} - {strategy_labels.get(t, 'Custom')}" for t in usable}
+                    funds = monthly[usable].rename(columns=labels)
+                    perf = funds.copy()
+                    perf[bench_label] = bench
+
+                    rf = cached_hf_risk_free(hf_years, _today_str)
+                    if rf is None:
+                        rf = 0.0
+                        st.caption("FRED could not be reached: the risk-free rate is set to 0% for "
+                                   "Sharpe, Sortino and alpha.")
+                    table = lib.hedge_fund_risk_table(funds, bench, rf)
+                    st.session_state["hf_risk_table"] = table
+
+                    with st.expander("Vehicles and currency conversion"):
+                        hf_info = cached_asset_info(tuple(usable))
+                        veh = pd.DataFrame({
+                            "Name": [hf_info.loc[t, "Name"] if t in hf_info.index else t for t in usable],
+                            "Strategy": [strategy_labels.get(t, "Custom") for t in usable],
+                            "Quote currency": [hf_meta[t][0] for t in usable],
+                            "Price factor": [hf_meta[t][1] for t in usable],
+                        }, index=usable)
+                        st.dataframe(veh, use_container_width=True)
+                        st.caption("Price factor 0.01 = quoted in a minor unit (pence): converted to the "
+                                   "major unit before the USD conversion.")
+
+                    st.markdown("### Cumulative performance")
+                    fig = px.line(lib.rebase_to_zero(perf))
+                    fig.update_layout(yaxis_tickformat=",.0%", yaxis_title="Cumulative performance",
+                                      legend_title="")
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown("### Risk and return statistics")
+                    fmt = {
+                        "Months": "{:.0f}", "Ann. Return (CAGR)": "{:.2%}", "Ann. Volatility": "{:.2%}",
+                        "Sharpe Ratio": "{:.2f}", "Sortino Ratio": "{:.2f}", "Max Drawdown": "{:.2%}",
+                        "Longest Drawdown (months)": "{:.0f}", "Calmar Ratio": "{:.2f}",
+                        "Skewness": "{:.2f}", "Excess Kurtosis": "{:.2f}",
+                        "Modified VaR 95% (1m)": "{:.2%}", "Beta vs Benchmark": "{:.2f}",
+                        "Alpha (ann.)": "{:.2%}", "Correlation vs Benchmark": "{:.2f}",
+                        "Upside Capture": "{:.0%}", "Downside Capture": "{:.0%}",
+                        "Autocorrelation (lag 1)": "{:.2f}", "Unsmoothed Volatility": "{:.2%}",
+                    }
+                    shown = table.T.astype(object)
+                    for metric, f in fmt.items():
+                        if metric in shown.index:
+                            shown.loc[metric] = [f.format(v) if pd.notna(v) else "-" for v in table[metric]]
+                    st.dataframe(shown, use_container_width=True)
+                    st.caption(
+                        "Benchmark = MSCI World. Sharpe/Sortino use the average US 3-month T-bill yield. "
+                        "Modified VaR is the Cornish-Fisher VaR: it adjusts the 95% loss for skewness and "
+                        "fat tails, which a normal VaR ignores. Capture ratios compare the fund's average "
+                        "return with MSCI World's in the months MSCI World was up / down."
+                    )
+
+                    st.markdown("### Drawdowns")
+                    dd = pd.DataFrame({c: lib.drawdown_series(perf[c]) for c in perf.columns})
+                    fig = px.line(dd)
+                    fig.update_layout(yaxis_tickformat=",.0%", yaxis_title="Drawdown", legend_title="")
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.markdown("### Return smoothing check")
+                    smooth = table[["Autocorrelation (lag 1)", "Ann. Volatility", "Unsmoothed Volatility"]].copy()
+                    smooth["Volatility understated by"] = smooth["Unsmoothed Volatility"] / smooth["Ann. Volatility"] - 1
+                    st.dataframe(
+                        smooth.style.format({
+                            "Autocorrelation (lag 1)": "{:.2f}", "Ann. Volatility": "{:.2%}",
+                            "Unsmoothed Volatility": "{:.2%}", "Volatility understated by": "{:+.0%}",
+                        }),
+                        use_container_width=True,
+                    )
+                    flagged = [c for c in table.index if table.loc[c, "Autocorrelation (lag 1)"] > 0.2]
+                    if flagged:
+                        st.warning(
+                            "Possible return smoothing (lag-1 autocorrelation above 0.2) for: "
+                            + ", ".join(flagged) + ". Reported volatility probably understates the true "
+                            "risk, and Sharpe ratios and mean-variance weights built on it will look too good."
+                        )
+                    else:
+                        st.info(
+                            "No strong smoothing in these listed, daily-liquid proxies - expected. Private "
+                            "hedge fund NAVs are usually far more smoothed: run this same test on their "
+                            "reported monthly returns before trusting their volatility or Sharpe ratio."
+                        )
+
+                    st.markdown("### Diversification")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        corr_hf = lib.compute_correlation_matrix(perf)
+                        fig = px.imshow(corr_hf, color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+                                        text_auto=".2f", aspect="auto", title="Correlation of monthly returns")
+                        st.plotly_chart(fig, use_container_width=True)
+                    with c2:
+                        if len(monthly) >= 24:
+                            roll = pd.DataFrame({c: lib.rolling_correlation(funds[c], bench, 12)
+                                                 for c in funds.columns}).dropna(how="all")
+                            fig = px.line(roll, title="12-month rolling correlation with MSCI World")
+                            fig.update_layout(yaxis_title="Correlation", legend_title="")
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("At least 24 months are needed for a 12-month rolling correlation.")
+
+                    st.download_button(
+                        "Download monthly returns (CSV)", perf.to_csv().encode("utf-8"),
+                        file_name="hedge_fund_proxies_monthly_returns.csv", mime="text/csv",
+                    )
+                    st.caption(
+                        "Limits: these are proxies with their own fees and daily liquidity. PSH.L is a listed "
+                        "company that can trade at a discount or premium to its NAV, so its price returns are "
+                        "more equity-like than the underlying fund. Only past returns, over the common period "
+                        "shown above."
                     )
 
 with tab_data:
