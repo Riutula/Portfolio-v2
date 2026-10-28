@@ -20,17 +20,24 @@ from scipy.optimize import minimize
 
 DEFAULT_TICKERS = [
     'CRM', 'HOLN.SW', 'LLY', 'NESN.SW', 'CTPNV.AS', '5JS.SI',
-    'AMRZ', 'ASCN.SW', 'TPXE.PA', 'ECL', 'HYG', '0P00000BKL','LU2573967036-USD.LU', 'DGE.L'
+    'AMRZ', 'ASCN.SW', 'TPXE.PA', 'ECL', 'HYG', '0P00000BKL','LU2573967036-USD.LU',
+    'DGE.L',
 ]
 
 DEFAULT_CURRENCY_MAP = {
     'CRM': 'USD', 'HOLN.SW': 'CHF', 'LLY': 'USD', 'NESN.SW': 'CHF',
     'CTPNV.AS': 'EUR', '5JS.SI': 'SGD', 'AMRZ': 'USD', 'ASCN.SW': 'CHF',
-    'TPXE.PA': 'EUR', 'ECL': 'USD', 'HYG': 'USD', '0P00000BKL': 'USD','LU2573967036-USD.LU' : 'USD', 'DGE.L' : 'GBp'
+    'TPXE.PA': 'EUR', 'ECL': 'USD', 'HYG': 'USD', '0P00000BKL': 'USD','LU2573967036-USD.LU' : 'USD',
+    'DGE.L': 'GBP',
 }
+
+# Default tickers that Yahoo quotes in a minor currency unit: factor applied
+# to the raw price to get back to the major unit (DGE.L is quoted in pence).
+DEFAULT_PRICE_SCALE = {'DGE.L': 0.01}
 
 BENCHMARK_BY_CURRENCY = {
     'USD': 'SPY', 'CHF': 'CSSMI.SW', 'EUR': 'EXS1.DE', 'SGD': 'ES3.SI',
+    'GBP': 'ISF.L',  # iShares Core FTSE 100 UCITS ETF (GBP, quoted in pence)
 }
 # TPXE.PA is an EUR-listed ETF tracking the Japanese TOPIX - mapped to itself
 # rather than bucketed with other EUR names (see notebook Part 3 for the
@@ -62,19 +69,43 @@ def _to_series(x):
     return x
 
 
-def detect_currency(ticker):
-    """Best-effort currency detection for a ticker not in DEFAULT_CURRENCY_MAP
-    (i.e. one the user typed in manually), via yfinance metadata. Falls back
-    to 'USD' if detection fails - the price will still load, just make sure
-    to sanity-check the FX conversion for that ticker if it's wrong."""
+# Yahoo quotes some listings in a minor currency unit (e.g. London stocks in
+# pence, "GBp"). Naively upper-casing "GBp" -> "GBP" would treat pence as
+# pounds and make the price 100x too high, so these are mapped to the ISO
+# currency plus the factor needed to get back to the major unit.
+CURRENCY_ALIASES = {
+    'GBp': ('GBP', 0.01), 'GBX': ('GBP', 0.01),
+    'ZAc': ('ZAR', 0.01), 'ILA': ('ILS', 0.01),
+}
+
+
+def split_currency_code(raw):
+    """Map a Yahoo currency code to (ISO currency, price scale factor)."""
+    if not raw:
+        return None, 1.0
+    if raw in CURRENCY_ALIASES:
+        return CURRENCY_ALIASES[raw]
+    return str(raw).upper(), 1.0
+
+
+def detect_currency_and_scale(ticker):
+    """Best-effort (ISO currency, price scale) for a ticker not in
+    DEFAULT_CURRENCY_MAP (i.e. one the user typed in manually), via yfinance
+    metadata. Falls back to ('USD', 1.0) if detection fails - the price will
+    still load, just sanity-check the FX conversion for that ticker."""
     try:
         info = yf.Ticker(ticker).info
-        ccy = info.get('currency')
-        if ccy:
-            return ccy.upper()
+        iso, scale = split_currency_code(info.get('currency'))
+        if iso:
+            return iso, scale
     except Exception:
         pass
-    return 'USD'
+    return 'USD', 1.0
+
+
+def detect_currency(ticker):
+    """ISO currency only (kept for backward compatibility)."""
+    return detect_currency_and_scale(ticker)[0]
 
 
 def load_fx_data(currencies, start_date, end_date):
@@ -90,12 +121,20 @@ def load_fx_data(currencies, start_date, end_date):
     return data
 
 
-def load_prices_chf(tickers, currency_map, start_date, end_date, fx_data=None):
+def load_prices_chf(tickers, currency_map, start_date, end_date, fx_data=None, price_scale=None):
     """Download adjusted (dividend-inclusive) prices for `tickers` and
-    convert them to CHF using `currency_map`."""
+    convert them to CHF using `currency_map`. `price_scale` optionally maps
+    ticker -> factor applied BEFORE the FX conversion (e.g. 0.01 for a
+    London stock quoted in pence). Returns are unaffected by a constant
+    factor; it matters for price levels shown in the app."""
     prices = yf.download(tickers, start=start_date, end=end_date, auto_adjust=True)['Close']
     if isinstance(prices, pd.Series):
         prices = prices.to_frame(name=tickers[0])
+    if price_scale:
+        prices = prices.copy()
+        for t, factor in price_scale.items():
+            if t in prices.columns and factor != 1.0:
+                prices[t] = prices[t] * factor
 
     if fx_data is None:
         fx_data = load_fx_data(currency_map.values(), start_date, end_date)
@@ -724,3 +763,213 @@ def blend_weights(min_var_weights, mean_var_weights, risk_category):
     w_minvar, w_meanvar = RISK_BLEND[risk_category]
     combined = w_minvar * min_var_weights + w_meanvar * mean_var_weights.reindex(min_var_weights.index).fillna(0)
     return combined
+
+
+# ---------------------------------------------------------------------
+# Hedge fund analytics (monthly returns, non-normal risk, smoothing)
+# ---------------------------------------------------------------------
+from scipy.stats import norm as _norm, skew as _skew, kurtosis as _kurtosis  # noqa: E402
+
+# Liquid, Yahoo-listed PROXIES for four hedge fund strategies. These are NOT
+# the private hedge funds themselves: they carry their own fees and offer
+# daily liquidity, so they only approximate the behaviour of the strategy.
+HEDGE_FUND_PROXIES = {
+    'FTLS': 'Equity Hedge',
+    'PSH.L': 'Value / Activist',
+    'AEDNX': 'Event Driven',
+    'QAI': 'Multi-Strategy',
+}
+HEDGE_FUND_BENCHMARK = 'URTH'  # iShares MSCI World ETF (USD)
+
+
+def load_prices_usd(tickers, start_date, end_date):
+    """Adjusted daily prices converted to USD, the native currency of most
+    hedge fund proxies (this isolates strategy behaviour from CHF FX noise).
+    Minor-unit quotes (pence...) are rescaled first. Returns
+    (prices_usd, meta, dropped) where meta maps ticker -> (currency, scale)
+    and dropped maps ticker -> reason it could not be used."""
+    tickers = list(tickers)
+    raw = yf.download(tickers, start=start_date, end=end_date, auto_adjust=True)['Close']
+    if isinstance(raw, pd.Series):
+        raw = raw.to_frame(name=tickers[0])
+    raw = raw.reindex(columns=tickers)
+
+    meta = {t: detect_currency_and_scale(t) for t in tickers}
+    fx_ccys = sorted({ccy for ccy, _ in meta.values()} - {'USD'})
+    fx = pd.DataFrame(index=raw.index)
+    if fx_ccys:
+        pairs = [c + 'USD=X' for c in fx_ccys]
+        fx = yf.download(pairs, start=start_date, end=end_date, auto_adjust=True)['Close']
+        if isinstance(fx, pd.Series):
+            fx = fx.to_frame(name=pairs[0])
+
+    prices, dropped = {}, {}
+    for t in tickers:
+        ccy, scale = meta[t]
+        s = raw[t] * scale
+        if s.dropna().empty:
+            dropped[t] = "no price data found on Yahoo (check the symbol)"
+            continue
+        if ccy != 'USD':
+            pair = ccy + 'USD=X'
+            if pair not in fx.columns or fx[pair].dropna().empty:
+                dropped[t] = f"FX rate {pair} unavailable on Yahoo"
+                continue
+            s = s * fx[pair].reindex(s.index).ffill()
+        prices[t] = s
+    return pd.DataFrame(prices), meta, dropped
+
+
+def monthly_returns_from_prices(prices, asof=None):
+    """Month-end to month-end simple returns. If `asof` falls inside a month
+    that has not finished yet, that incomplete month is dropped."""
+    p = prices.copy()
+    p.index = pd.to_datetime(p.index)
+    p = p.sort_index().dropna(how='all')
+    monthly = p.groupby(p.index.to_period('M')).last()
+    monthly.index = monthly.index.to_timestamp(how='end').normalize()
+    rets = monthly / monthly.shift(1) - 1.0
+    if asof is not None and len(rets):
+        asof = pd.Timestamp(asof)
+        if rets.index[-1].to_period('M') == asof.to_period('M') and asof.day < asof.days_in_month:
+            rets = rets.iloc[:-1]
+    return rets.iloc[1:]
+
+
+def drawdown_series(returns):
+    """Running drawdown from the previous peak of cumulative wealth (the
+    starting capital counts as the first peak)."""
+    r = returns.dropna()
+    wealth = (1 + r).cumprod()
+    peak = wealth.cummax().clip(lower=1.0)
+    return wealth / peak - 1.0
+
+
+def longest_drawdown_months(returns):
+    """Longest run of consecutive periods spent below the previous peak."""
+    longest = run = 0
+    for v in drawdown_series(returns).values:
+        run = run + 1 if v < 0 else 0
+        longest = max(longest, run)
+    return longest
+
+
+def cornish_fisher_var(returns, alpha=0.05):
+    """Modified (Cornish-Fisher) VaR: the quantile of a return distribution
+    adjusted for its skewness and excess kurtosis. Returned as a (negative)
+    return, like the other VaR figures in this app."""
+    r = returns.dropna()
+    if len(r) < 8:
+        return np.nan
+    z = _norm.ppf(alpha)
+    s = _skew(r, bias=False)
+    k = _kurtosis(r, fisher=True, bias=False)
+    z_cf = z + (z**2 - 1) * s / 6 + (z**3 - 3 * z) * k / 24 - (2 * z**3 - 5 * z) * (s**2) / 36
+    return r.mean() + z_cf * r.std(ddof=1)
+
+
+def capture_ratios(returns, benchmark):
+    """(upside capture, downside capture): the fund's geometric average
+    return divided by the benchmark's, over the months the benchmark was up /
+    down. A good hedge fund captures little of the downside."""
+    df = pd.concat([returns, benchmark], axis=1, join='inner').dropna()
+    df.columns = ['r', 'b']
+
+    def _capture(mask):
+        n = int(mask.sum())
+        if n == 0:
+            return np.nan
+        g_r = (1 + df.loc[mask, 'r']).prod() ** (1 / n) - 1
+        g_b = (1 + df.loc[mask, 'b']).prod() ** (1 / n) - 1
+        return g_r / g_b if g_b != 0 else np.nan
+
+    return _capture(df['b'] > 0), _capture(df['b'] < 0)
+
+
+def unsmooth_returns(returns, rho=None):
+    """Geltner unsmoothing. Illiquid or stale-priced assets report smoothed
+    returns (positive lag-1 autocorrelation), which understates volatility
+    and inflates the Sharpe ratio. With r_obs[t] = (1-rho)*r_true[t] +
+    rho*r_obs[t-1], the true return is (r_obs[t] - rho*r_obs[t-1]) / (1-rho).
+    `rho` defaults to the lag-1 autocorrelation, clipped to [0, 0.95].
+    Returns (unsmoothed_returns, rho_used)."""
+    r = returns.dropna()
+    if rho is None:
+        rho = r.autocorr(lag=1)
+    rho = 0.0 if pd.isna(rho) else float(np.clip(rho, 0.0, 0.95))
+    if rho == 0.0:
+        return r.copy(), 0.0
+    return ((r - rho * r.shift(1)) / (1 - rho)).dropna(), rho
+
+
+def rolling_correlation(returns, benchmark, window=12):
+    """Rolling correlation of a return series with a benchmark."""
+    return returns.rolling(window).corr(benchmark)
+
+
+def hedge_fund_risk_table(monthly_returns, benchmark=None, rf_annual=0.0):
+    """One row per fund with the risk statistics that matter for hedge funds
+    - drawdowns, downside risk and tail shape, capture ratios, equity beta,
+    and a check for return smoothing - on top of the usual return / vol /
+    Sharpe. `monthly_returns` is a DataFrame of monthly simple returns and
+    `benchmark` an optional monthly return Series (e.g. MSCI World)."""
+    rf_m = (1 + rf_annual) ** (1 / 12) - 1
+    rows = {}
+    for col in monthly_returns.columns:
+        r = monthly_returns[col].dropna()
+        n = len(r)
+        if n < 3:
+            continue
+        years = n / 12
+        cagr = (1 + r).prod() ** (1 / years) - 1
+        vol = r.std(ddof=1) * np.sqrt(12)
+        sharpe = (r.mean() - rf_m) * 12 / vol if vol > 0 else np.nan
+        downside = np.sqrt(np.mean(np.minimum(r - rf_m, 0.0) ** 2)) * np.sqrt(12)
+        sortino = (r.mean() - rf_m) * 12 / downside if downside > 0 else np.nan
+        mdd = drawdown_series(r).min()
+        rho = r.autocorr(lag=1)
+        unsmoothed, _ = unsmooth_returns(r)
+
+        beta = alpha = corr = up_cap = down_cap = np.nan
+        if benchmark is not None:
+            joined = pd.concat([r, benchmark], axis=1, join='inner').dropna()
+            if len(joined) >= 3:
+                rr, bb = joined.iloc[:, 0], joined.iloc[:, 1]
+                var_b = bb.var(ddof=1)
+                beta = rr.cov(bb) / var_b if var_b > 0 else np.nan
+                alpha = ((rr.mean() - rf_m) - beta * (bb.mean() - rf_m)) * 12
+                corr = rr.corr(bb)
+                up_cap, down_cap = capture_ratios(rr, bb)
+
+        rows[col] = {
+            'Months': n,
+            'Ann. Return (CAGR)': cagr,
+            'Ann. Volatility': vol,
+            'Sharpe Ratio': sharpe,
+            'Sortino Ratio': sortino,
+            'Max Drawdown': mdd,
+            'Longest Drawdown (months)': longest_drawdown_months(r),
+            'Calmar Ratio': cagr / abs(mdd) if mdd < 0 else np.nan,
+            'Skewness': _skew(r, bias=False),
+            'Excess Kurtosis': _kurtosis(r, fisher=True, bias=False),
+            'Modified VaR 95% (1m)': cornish_fisher_var(r),
+            'Beta vs Benchmark': beta,
+            'Alpha (ann.)': alpha,
+            'Correlation vs Benchmark': corr,
+            'Upside Capture': up_cap,
+            'Downside Capture': down_cap,
+            'Autocorrelation (lag 1)': rho,
+            'Unsmoothed Volatility': unsmoothed.std(ddof=1) * np.sqrt(12),
+        }
+    return pd.DataFrame(rows).T
+
+
+def average_risk_free_rate(start_date, end_date):
+    """Average annual US 3-month T-bill yield (FRED DTB3) over the period, as
+    a decimal. Returns None if FRED cannot be reached."""
+    try:
+        raw = web.DataReader('DTB3', 'fred', start=start_date, end=end_date)
+        value = float(raw.iloc[:, 0].dropna().mean() / 100)
+        return None if pd.isna(value) else value
+    except Exception:
+        return None
