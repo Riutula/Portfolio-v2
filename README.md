@@ -31,8 +31,7 @@ front-end (`app.py`).
   scores the client into one of 5 risk categories, each mapped to a blend
   of the Minimum-Variance and Mean-Variance portfolios' most robust,
   latest out-of-sample weights.
-- **Hedge Funds** — monthly-return analytics for liquid Yahoo-listed proxies of four hedge fund strategies (FTLS Equity Hedge, PSH.L Value/Activist, AEDNX Event Driven, QAI Multi-Strategy; any other ticker can be added), in USD against MSCI World: drawdowns, Sortino/Calmar, skewness and kurtosis, Cornish-Fisher VaR, upside/downside capture, beta/alpha, a return-smoothing check (autocorrelation + Geltner unsmoothing), correlations and rolling correlation. These are proxies, not the private funds.
-- **Raw Data** — CSV export of prices and returns.
+- **Hedge Funds** — has two sub-tabs. Manager search screens hedge fund managers by strategy, country of the manager (free text, English or French: `UK`, `Suisse`, `États-Unis`) and a minimum size slider (USD million). The built-in sample is the 20 largest managers by hedge fund assets (With Intelligence, 30 Jun 2025, via Altss) with an indicative strategy classification; upload your own universe as a CSV (Preqin / HFR / internal export, English or French headers) to screen a broader market. Proxy analytics — monthly-return analytics for liquid Yahoo-listed proxies of four hedge fund strategies (FTLS Equity Hedge, PSH.L Value/Activist, AEDNX Event Driven, QAI Multi-Strategy; any other ticker can be added), in USD against MSCI World: drawdowns, Sortino/Calmar, skewness and kurtosis, Cornish-Fisher VaR, upside/downside capture, beta/alpha, a return-smoothing check (autocorrelation + Geltner unsmoothing), correlations and rolling correlation. These are proxies, not the private funds.
 
 ## Project structure
 
