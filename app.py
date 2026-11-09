@@ -838,173 +838,290 @@ with tab_client:
 # Tab: Hedge funds (liquid proxies, monthly analytics)
 # ---------------------------------------------------------------------
 with tab_hf:
-    st.subheader("Hedge fund strategies (liquid proxies)")
-    st.caption(
-        "Yahoo Finance does not list private hedge funds. The vehicles below are listed companies and "
-        "liquid-alternative funds that follow the same strategies, used as PROXIES: they carry their own "
-        "fees and daily liquidity, so they approximate - not replicate - the private funds. Everything is "
-        "computed on MONTHLY returns, in USD (the native currency of the proxies, which isolates strategy "
-        "behaviour from CHF FX noise), against MSCI World."
-    )
+    sub_search, sub_proxies = st.tabs(["Manager search", "Proxy analytics"])
 
-    strategy_labels = dict(lib.HEDGE_FUND_PROXIES)
-    hf_tickers_raw = st.multiselect(
-        "Vehicles", options=list(strategy_labels), default=list(strategy_labels),
-        accept_new_options=True, key="hf_universe",
-        help="One liquid proxy per strategy by default. Type any other Yahoo Finance ticker to add it.",
-    )
-    hf_tickers = list(dict.fromkeys(t.strip().upper() for t in hf_tickers_raw if t.strip()))
-    hf_years = st.slider(
-        "History (years)", 3, 15, 10, key="hf_years",
-        help="The analysis uses the period common to all vehicles, so it is capped by the youngest one.",
-    )
-    if st.button("Run hedge fund analysis", type="primary", key="hf_run"):
-        st.session_state["hf_ran"] = True
+    with sub_search:
+        st.subheader("Hedge fund manager search")
+        st.caption(
+            "Screen hedge fund managers by strategy, country of the manager and minimum size. The built-in "
+            "sample is the 20 largest managers by hedge fund assets (see 'About this data'); for a real "
+            "screening, upload your own universe (e.g. a Preqin, HFR or eVestment export, or an internal "
+            "database) with the same columns."
+        )
 
-    if st.session_state.get("hf_ran"):
-        if not hf_tickers:
-            st.warning("Select at least one vehicle.")
+        uploaded = st.file_uploader(
+            "Use your own manager universe (CSV)", type=["csv"], key="mgr_upload",
+            help="Required columns: Manager, Strategies (several separated by | or ;), HQ Country, "
+                 "AUM (USD m). Optional: HQ City, AUM as of, Source, Notes. English or French headers.",
+        )
+        universe = lib.seed_manager_universe()
+        universe_label = f"Built-in sample: the {len(universe)} largest hedge fund managers (30 Jun 2025)."
+        if uploaded is not None:
+            try:
+                universe = lib.load_manager_universe(uploaded)
+                universe_label = f"Your file '{uploaded.name}': {len(universe)} managers."
+            except ValueError as exc:
+                st.error(f"{exc} The built-in sample is used instead.")
+        st.caption(universe_label)
+
+        f1, f2, f3 = st.columns([2, 2, 3])
+        with f1:
+            chosen_strategies = st.multiselect(
+                "Strategy", options=lib.manager_strategy_options(universe), default=[],
+                placeholder="All strategies", key="mgr_strategy",
+                help="A manager is kept if it carries at least one of the selected strategies.",
+            )
+        with f2:
+            country_query = st.text_input(
+                "Manager country (free text)", value="", key="mgr_country",
+                placeholder="e.g. UK, Switzerland, États-Unis",
+                help="Country of the manager's headquarters. English or French names and codes (UK, "
+                     "Suisse, USA...) work; separate several countries with commas.",
+            )
+        with f3:
+            _max_aum = universe["AUM (USD m)"].max()
+            _slider_max = int(-(-_max_aum // 5000) * 5000) if pd.notna(_max_aum) and _max_aum > 0 else 5000
+            min_aum = st.slider(
+                "Minimum hedge fund size (USD million)", 0, _slider_max, 0,
+                step=500 if _slider_max >= 20000 else 50, key="mgr_min_aum",
+            )
+
+        results = lib.search_managers(universe, chosen_strategies, country_query, min_aum)
+        st.session_state["mgr_results"] = results
+
+        interpreted = lib.interpret_country_query(country_query)
+        if interpreted:
+            st.caption("Country filter read as: " + ", ".join(
+                canon if canon else f"'{raw}' (partial name match)" for raw, canon in interpreted))
+
+        st.markdown(f"**{len(results)} of {len(universe)} managers match**")
+        if results.empty:
+            st.info(
+                "No manager matches these criteria. Relax a filter - and remember that the built-in sample "
+                "only contains the 20 largest managers (all above USD 30bn), based in the US and the UK. "
+                "Upload a broader universe to screen smaller or other-country managers."
+            )
         else:
-            _today = datetime.today()
-            _today_str = _today.strftime("%Y-%m-%d")
-            hf_prices, hf_meta, hf_dropped = cached_hf_data(tuple(hf_tickers), hf_years, _today_str)
-            if hf_dropped:
-                st.warning("Excluded: " + "; ".join(f"{t} ({why})" for t, why in hf_dropped.items()))
+            shown = pd.DataFrame({
+                "Manager": results["Manager"],
+                "Primary strategy": results["Primary Strategy"],
+                "All strategies": results["Strategies"].map("; ".join),
+                "HQ city": results["HQ City"],
+                "HQ country": results["HQ Country"],
+                "AUM (USD m)": results["AUM (USD m)"],
+                "AUM as of": results["AUM as of"],
+                "Notes": results["Notes"],
+            })
+            st.dataframe(shown.style.format({"AUM (USD m)": "{:,.0f}"}, na_rep="n/a"),
+                         use_container_width=True, hide_index=True)
+            sources = sorted(set(results["Source"]) - {""})
+            if sources:
+                st.caption("Source: " + " | ".join(sources))
 
-            bench_t = lib.HEDGE_FUND_BENCHMARK
-            if bench_t not in hf_prices.columns:
-                st.error("Could not download the MSCI World benchmark (URTH) - cannot compute the statistics.")
+            fig = px.bar(results.head(15).iloc[::-1], x="AUM (USD m)", y="Manager", orientation="h",
+                         color="Primary Strategy", title="Largest matches by hedge fund assets")
+            fig.update_layout(legend_title="Primary strategy", yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.download_button(
+                "Download these results (CSV)", lib.manager_universe_to_csv(results),
+                file_name="hedge_fund_manager_search.csv", mime="text/csv", key="mgr_download",
+            )
+
+        st.download_button(
+            "Download the current universe (CSV) - use it as a template for your own",
+            lib.manager_universe_to_csv(universe),
+            file_name="hedge_fund_manager_universe.csv", mime="text/csv", key="mgr_template",
+        )
+
+        with st.expander("About this data - please read"):
+            st.markdown(
+                "- **Source of the built-in sample:** the 20 largest hedge fund managers by net hedge fund "
+                "assets, With Intelligence 'Billion Dollar Club' at 30 June 2025, as published on "
+                "altss.com/rankings/largest-hedge-funds. Only these 20 managers are included: all are above "
+                "USD 30bn and based in the US or the UK, so the size filter starts high and there are no "
+                "Swiss, European or mid-size managers.\n"
+                "- **Size** is the manager's hedge fund assets, not the size of one particular fund. Four "
+                "rows (BlackRock, Goldman Sachs AM, Wellington, PIMCO) are the hedge fund sleeve of a much "
+                "larger long-only firm. Providers measure assets differently (net vs regulatory), so "
+                "figures differ between sources.\n"
+                "- **Strategies** are an indicative classification assigned from the style description in "
+                "the source (HFR-style taxonomy: Equity Hedge, Event Driven, Global Macro, Relative Value, "
+                "Multi-Strategy, Managed Futures / CTA, Quantitative / Systematic, Credit). They are not an "
+                "official provider tag.\n"
+                "- **No performance data and no recommendation:** this is a screening tool, not a ranking of "
+                "quality. A file you upload is processed in memory for your session only and is not saved "
+                "by this app."
+            )
+
+    with sub_proxies:
+        st.subheader("Hedge fund strategies (liquid proxies)")
+        st.caption(
+            "Yahoo Finance does not list private hedge funds. The vehicles below are listed companies and "
+            "liquid-alternative funds that follow the same strategies, used as PROXIES: they carry their own "
+            "fees and daily liquidity, so they approximate - not replicate - the private funds. Everything is "
+            "computed on MONTHLY returns, in USD (the native currency of the proxies, which isolates strategy "
+            "behaviour from CHF FX noise), against MSCI World."
+        )
+
+        strategy_labels = dict(lib.HEDGE_FUND_PROXIES)
+        hf_tickers_raw = st.multiselect(
+            "Vehicles", options=list(strategy_labels), default=list(strategy_labels),
+            accept_new_options=True, key="hf_universe",
+            help="One liquid proxy per strategy by default. Type any other Yahoo Finance ticker to add it.",
+        )
+        hf_tickers = list(dict.fromkeys(t.strip().upper() for t in hf_tickers_raw if t.strip()))
+        hf_years = st.slider(
+            "History (years)", 3, 15, 10, key="hf_years",
+            help="The analysis uses the period common to all vehicles, so it is capped by the youngest one.",
+        )
+        if st.button("Run hedge fund analysis", type="primary", key="hf_run"):
+            st.session_state["hf_ran"] = True
+
+        if st.session_state.get("hf_ran"):
+            if not hf_tickers:
+                st.warning("Select at least one vehicle.")
             else:
-                monthly_all = lib.monthly_returns_from_prices(hf_prices, asof=_today)
-                first_valid = monthly_all.apply(lambda s: s.first_valid_index())
-                monthly = monthly_all.dropna(how="any")
-                usable = [t for t in hf_tickers if t in monthly.columns]
+                _today = datetime.today()
+                _today_str = _today.strftime("%Y-%m-%d")
+                hf_prices, hf_meta, hf_dropped = cached_hf_data(tuple(hf_tickers), hf_years, _today_str)
+                if hf_dropped:
+                    st.warning("Excluded: " + "; ".join(f"{t} ({why})" for t, why in hf_dropped.items()))
 
-                if not usable or len(monthly) < 12:
-                    st.warning(
-                        "Not enough common monthly history (at least 12 months needed). Remove the "
-                        "youngest vehicle or shorten the history."
-                    )
+                bench_t = lib.HEDGE_FUND_BENCHMARK
+                if bench_t not in hf_prices.columns:
+                    st.error("Could not download the MSCI World benchmark (URTH) - cannot compute the statistics.")
                 else:
-                    youngest = first_valid[usable].idxmax()
-                    st.caption(
-                        f"Common period: {monthly.index[0]:%b %Y} → {monthly.index[-1]:%b %Y} "
-                        f"({len(monthly)} months), limited by {youngest} (the youngest vehicle)."
-                    )
+                    monthly_all = lib.monthly_returns_from_prices(hf_prices, asof=_today)
+                    first_valid = monthly_all.apply(lambda s: s.first_valid_index())
+                    monthly = monthly_all.dropna(how="any")
+                    usable = [t for t in hf_tickers if t in monthly.columns]
 
-                    bench_label = "MSCI World (URTH)"
-                    bench = monthly[bench_t]
-                    labels = {t: f"{t} - {strategy_labels.get(t, 'Custom')}" for t in usable}
-                    funds = monthly[usable].rename(columns=labels)
-                    perf = funds.copy()
-                    perf[bench_label] = bench
-
-                    rf = cached_hf_risk_free(hf_years, _today_str)
-                    if rf is None:
-                        rf = 0.0
-                        st.caption("FRED could not be reached: the risk-free rate is set to 0% for "
-                                   "Sharpe, Sortino and alpha.")
-                    table = lib.hedge_fund_risk_table(funds, bench, rf)
-                    st.session_state["hf_risk_table"] = table
-
-                    with st.expander("Vehicles and currency conversion"):
-                        hf_info = cached_asset_info(tuple(usable))
-                        veh = pd.DataFrame({
-                            "Name": [hf_info.loc[t, "Name"] if t in hf_info.index else t for t in usable],
-                            "Strategy": [strategy_labels.get(t, "Custom") for t in usable],
-                            "Quote currency": [hf_meta[t][0] for t in usable],
-                            "Price factor": [hf_meta[t][1] for t in usable],
-                        }, index=usable)
-                        st.dataframe(veh, use_container_width=True)
-                        st.caption("Price factor 0.01 = quoted in a minor unit (pence): converted to the "
-                                   "major unit before the USD conversion.")
-
-                    st.markdown("### Cumulative performance")
-                    fig = px.line(lib.rebase_to_zero(perf))
-                    fig.update_layout(yaxis_tickformat=",.0%", yaxis_title="Cumulative performance",
-                                      legend_title="")
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    st.markdown("### Risk and return statistics")
-                    fmt = {
-                        "Months": "{:.0f}", "Ann. Return (CAGR)": "{:.2%}", "Ann. Volatility": "{:.2%}",
-                        "Sharpe Ratio": "{:.2f}", "Sortino Ratio": "{:.2f}", "Max Drawdown": "{:.2%}",
-                        "Longest Drawdown (months)": "{:.0f}", "Calmar Ratio": "{:.2f}",
-                        "Skewness": "{:.2f}", "Excess Kurtosis": "{:.2f}",
-                        "Modified VaR 95% (1m)": "{:.2%}", "Beta vs Benchmark": "{:.2f}",
-                        "Alpha (ann.)": "{:.2%}", "Correlation vs Benchmark": "{:.2f}",
-                        "Upside Capture": "{:.0%}", "Downside Capture": "{:.0%}",
-                        "Autocorrelation (lag 1)": "{:.2f}", "Unsmoothed Volatility": "{:.2%}",
-                    }
-                    shown = table.T.astype(object)
-                    for metric, f in fmt.items():
-                        if metric in shown.index:
-                            shown.loc[metric] = [f.format(v) if pd.notna(v) else "-" for v in table[metric]]
-                    st.dataframe(shown, use_container_width=True)
-                    st.caption(
-                        "Benchmark = MSCI World. Sharpe/Sortino use the average US 3-month T-bill yield. "
-                        "Modified VaR is the Cornish-Fisher VaR: it adjusts the 95% loss for skewness and "
-                        "fat tails, which a normal VaR ignores. Capture ratios compare the fund's average "
-                        "return with MSCI World's in the months MSCI World was up / down."
-                    )
-
-                    st.markdown("### Drawdowns")
-                    dd = pd.DataFrame({c: lib.drawdown_series(perf[c]) for c in perf.columns})
-                    fig = px.line(dd)
-                    fig.update_layout(yaxis_tickformat=",.0%", yaxis_title="Drawdown", legend_title="")
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    st.markdown("### Return smoothing check")
-                    smooth = table[["Autocorrelation (lag 1)", "Ann. Volatility", "Unsmoothed Volatility"]].copy()
-                    smooth["Volatility understated by"] = smooth["Unsmoothed Volatility"] / smooth["Ann. Volatility"] - 1
-                    st.dataframe(
-                        smooth.style.format({
-                            "Autocorrelation (lag 1)": "{:.2f}", "Ann. Volatility": "{:.2%}",
-                            "Unsmoothed Volatility": "{:.2%}", "Volatility understated by": "{:+.0%}",
-                        }),
-                        use_container_width=True,
-                    )
-                    flagged = [c for c in table.index if table.loc[c, "Autocorrelation (lag 1)"] > 0.2]
-                    if flagged:
+                    if not usable or len(monthly) < 12:
                         st.warning(
-                            "Possible return smoothing (lag-1 autocorrelation above 0.2) for: "
-                            + ", ".join(flagged) + ". Reported volatility probably understates the true "
-                            "risk, and Sharpe ratios and mean-variance weights built on it will look too good."
+                            "Not enough common monthly history (at least 12 months needed). Remove the "
+                            "youngest vehicle or shorten the history."
                         )
                     else:
-                        st.info(
-                            "No strong smoothing in these listed, daily-liquid proxies - expected. Private "
-                            "hedge fund NAVs are usually far more smoothed: run this same test on their "
-                            "reported monthly returns before trusting their volatility or Sharpe ratio."
+                        youngest = first_valid[usable].idxmax()
+                        st.caption(
+                            f"Common period: {monthly.index[0]:%b %Y} → {monthly.index[-1]:%b %Y} "
+                            f"({len(monthly)} months), limited by {youngest} (the youngest vehicle)."
                         )
 
-                    st.markdown("### Diversification")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        corr_hf = lib.compute_correlation_matrix(perf)
-                        fig = px.imshow(corr_hf, color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
-                                        text_auto=".2f", aspect="auto", title="Correlation of monthly returns")
-                        st.plotly_chart(fig, use_container_width=True)
-                    with c2:
-                        if len(monthly) >= 24:
-                            roll = pd.DataFrame({c: lib.rolling_correlation(funds[c], bench, 12)
-                                                 for c in funds.columns}).dropna(how="all")
-                            fig = px.line(roll, title="12-month rolling correlation with MSCI World")
-                            fig.update_layout(yaxis_title="Correlation", legend_title="")
-                            st.plotly_chart(fig, use_container_width=True)
-                        else:
-                            st.info("At least 24 months are needed for a 12-month rolling correlation.")
+                        bench_label = "MSCI World (URTH)"
+                        bench = monthly[bench_t]
+                        labels = {t: f"{t} - {strategy_labels.get(t, 'Custom')}" for t in usable}
+                        funds = monthly[usable].rename(columns=labels)
+                        perf = funds.copy()
+                        perf[bench_label] = bench
 
-                    st.download_button(
-                        "Download monthly returns (CSV)", perf.to_csv().encode("utf-8"),
-                        file_name="hedge_fund_proxies_monthly_returns.csv", mime="text/csv",
-                    )
-                    st.caption(
-                        "Limits: these are proxies with their own fees and daily liquidity. PSH.L is a listed "
-                        "company that can trade at a discount or premium to its NAV, so its price returns are "
-                        "more equity-like than the underlying fund. Only past returns, over the common period "
-                        "shown above."
-                    )
+                        rf = cached_hf_risk_free(hf_years, _today_str)
+                        if rf is None:
+                            rf = 0.0
+                            st.caption("FRED could not be reached: the risk-free rate is set to 0% for "
+                                       "Sharpe, Sortino and alpha.")
+                        table = lib.hedge_fund_risk_table(funds, bench, rf)
+                        st.session_state["hf_risk_table"] = table
+
+                        with st.expander("Vehicles and currency conversion"):
+                            hf_info = cached_asset_info(tuple(usable))
+                            veh = pd.DataFrame({
+                                "Name": [hf_info.loc[t, "Name"] if t in hf_info.index else t for t in usable],
+                                "Strategy": [strategy_labels.get(t, "Custom") for t in usable],
+                                "Quote currency": [hf_meta[t][0] for t in usable],
+                                "Price factor": [hf_meta[t][1] for t in usable],
+                            }, index=usable)
+                            st.dataframe(veh, use_container_width=True)
+                            st.caption("Price factor 0.01 = quoted in a minor unit (pence): converted to the "
+                                       "major unit before the USD conversion.")
+
+                        st.markdown("### Cumulative performance")
+                        fig = px.line(lib.rebase_to_zero(perf))
+                        fig.update_layout(yaxis_tickformat=",.0%", yaxis_title="Cumulative performance",
+                                          legend_title="")
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        st.markdown("### Risk and return statistics")
+                        fmt = {
+                            "Months": "{:.0f}", "Ann. Return (CAGR)": "{:.2%}", "Ann. Volatility": "{:.2%}",
+                            "Sharpe Ratio": "{:.2f}", "Sortino Ratio": "{:.2f}", "Max Drawdown": "{:.2%}",
+                            "Longest Drawdown (months)": "{:.0f}", "Calmar Ratio": "{:.2f}",
+                            "Skewness": "{:.2f}", "Excess Kurtosis": "{:.2f}",
+                            "Modified VaR 95% (1m)": "{:.2%}", "Beta vs Benchmark": "{:.2f}",
+                            "Alpha (ann.)": "{:.2%}", "Correlation vs Benchmark": "{:.2f}",
+                            "Upside Capture": "{:.0%}", "Downside Capture": "{:.0%}",
+                            "Autocorrelation (lag 1)": "{:.2f}", "Unsmoothed Volatility": "{:.2%}",
+                        }
+                        shown = table.T.astype(object)
+                        for metric, f in fmt.items():
+                            if metric in shown.index:
+                                shown.loc[metric] = [f.format(v) if pd.notna(v) else "-" for v in table[metric]]
+                        st.dataframe(shown, use_container_width=True)
+                        st.caption(
+                            "Benchmark = MSCI World. Sharpe/Sortino use the average US 3-month T-bill yield. "
+                            "Modified VaR is the Cornish-Fisher VaR: it adjusts the 95% loss for skewness and "
+                            "fat tails, which a normal VaR ignores. Capture ratios compare the fund's average "
+                            "return with MSCI World's in the months MSCI World was up / down."
+                        )
+
+                        st.markdown("### Drawdowns")
+                        dd = pd.DataFrame({c: lib.drawdown_series(perf[c]) for c in perf.columns})
+                        fig = px.line(dd)
+                        fig.update_layout(yaxis_tickformat=",.0%", yaxis_title="Drawdown", legend_title="")
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        st.markdown("### Return smoothing check")
+                        smooth = table[["Autocorrelation (lag 1)", "Ann. Volatility", "Unsmoothed Volatility"]].copy()
+                        smooth["Volatility understated by"] = smooth["Unsmoothed Volatility"] / smooth["Ann. Volatility"] - 1
+                        st.dataframe(
+                            smooth.style.format({
+                                "Autocorrelation (lag 1)": "{:.2f}", "Ann. Volatility": "{:.2%}",
+                                "Unsmoothed Volatility": "{:.2%}", "Volatility understated by": "{:+.0%}",
+                            }),
+                            use_container_width=True,
+                        )
+                        flagged = [c for c in table.index if table.loc[c, "Autocorrelation (lag 1)"] > 0.2]
+                        if flagged:
+                            st.warning(
+                                "Possible return smoothing (lag-1 autocorrelation above 0.2) for: "
+                                + ", ".join(flagged) + ". Reported volatility probably understates the true "
+                                "risk, and Sharpe ratios and mean-variance weights built on it will look too good."
+                            )
+                        else:
+                            st.info(
+                                "No strong smoothing in these listed, daily-liquid proxies - expected. Private "
+                                "hedge fund NAVs are usually far more smoothed: run this same test on their "
+                                "reported monthly returns before trusting their volatility or Sharpe ratio."
+                            )
+
+                        st.markdown("### Diversification")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            corr_hf = lib.compute_correlation_matrix(perf)
+                            fig = px.imshow(corr_hf, color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+                                            text_auto=".2f", aspect="auto", title="Correlation of monthly returns")
+                            st.plotly_chart(fig, use_container_width=True)
+                        with c2:
+                            if len(monthly) >= 24:
+                                roll = pd.DataFrame({c: lib.rolling_correlation(funds[c], bench, 12)
+                                                     for c in funds.columns}).dropna(how="all")
+                                fig = px.line(roll, title="12-month rolling correlation with MSCI World")
+                                fig.update_layout(yaxis_title="Correlation", legend_title="")
+                                st.plotly_chart(fig, use_container_width=True)
+                            else:
+                                st.info("At least 24 months are needed for a 12-month rolling correlation.")
+
+                        st.download_button(
+                            "Download monthly returns (CSV)", perf.to_csv().encode("utf-8"),
+                            file_name="hedge_fund_proxies_monthly_returns.csv", mime="text/csv",
+                        )
+                        st.caption(
+                            "Limits: these are proxies with their own fees and daily liquidity. PSH.L is a listed "
+                            "company that can trade at a discount or premium to its NAV, so its price returns are "
+                            "more equity-like than the underlying fund. Only past returns, over the common period "
+                            "shown above."
+                        )
 
 with tab_data:
     st.subheader("Daily returns (CHF)")
