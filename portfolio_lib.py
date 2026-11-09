@@ -973,3 +973,291 @@ def average_risk_free_rate(start_date, end_date):
         return None if pd.isna(value) else value
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------
+# Hedge fund manager search (screener over a manager universe)
+# ---------------------------------------------------------------------
+import io as _io  # noqa: E402
+import re as _re  # noqa: E402
+import unicodedata as _unicodedata  # noqa: E402
+
+# Strategy taxonomy used by the screener (HFR-style). A manager can carry
+# several tags; the first one is its primary strategy.
+MANAGER_STRATEGIES = [
+    "Equity Hedge", "Event Driven", "Global Macro", "Relative Value",
+    "Multi-Strategy", "Managed Futures / CTA", "Quantitative / Systematic", "Credit",
+]
+MANAGER_REQUIRED_COLUMNS = ["Manager", "Strategies", "HQ Country", "AUM (USD m)"]
+MANAGER_OPTIONAL_COLUMNS = ["HQ City", "AUM as of", "Source", "Notes"]
+
+
+def normalize_text(text):
+    """Lower-case, accent-free, punctuation-free text ("États-Unis" -> "etats unis")."""
+    s = _unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode("ascii")
+    return _re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+_STRATEGY_ALIASES_RAW = {
+    "Equity Hedge": ["equity long short", "long short equity", "equity l s", "fundamental long short",
+                     "long short", "equity market neutral"],
+    "Event Driven": ["merger arbitrage", "merger arb", "risk arbitrage", "distressed", "special situations",
+                     "activist", "activism"],
+    "Global Macro": ["macro", "discretionary macro"],
+    "Relative Value": ["fixed income arbitrage", "convertible arbitrage", "volatility arbitrage"],
+    "Multi-Strategy": ["multi strategy", "multistrategy", "multi manager"],
+    "Managed Futures / CTA": ["managed futures", "cta", "trend following", "commodity trading advisor"],
+    "Quantitative / Systematic": ["quantitative", "quant", "systematic", "statistical arbitrage", "stat arb"],
+    "Credit": ["structured credit", "fixed income", "direct lending"],
+}
+_STRATEGY_LOOKUP = {
+    normalize_text(alias): canon
+    for canon, aliases in _STRATEGY_ALIASES_RAW.items() for alias in [canon] + aliases
+}
+
+
+def canonical_strategy(tag):
+    """Map a free-text strategy label to the taxonomy; an unknown label is kept as is."""
+    tag = str(tag).strip()
+    if not tag or tag.lower() == "nan":
+        return None
+    return _STRATEGY_LOOKUP.get(normalize_text(tag), tag)
+
+
+def parse_strategies(cell):
+    """List of canonical strategies from a cell ('A | B', 'A; B' or a list); order kept."""
+    if cell is None or (isinstance(cell, float) and pd.isna(cell)):
+        return []
+    parts = list(cell) if isinstance(cell, (list, tuple)) else _re.split(r"[;|\n]", str(cell))
+    out = []
+    for p in parts:
+        c = canonical_strategy(p)
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
+_COUNTRY_ALIASES_RAW = {
+    "United States": ["us", "usa", "u s", "u s a", "united states of america", "etats unis", "america", "amerique"],
+    "United Kingdom": ["uk", "u k", "gb", "great britain", "britain", "grande bretagne", "royaume uni",
+                       "angleterre", "england", "scotland", "ecosse"],
+    "Switzerland": ["ch", "suisse", "schweiz", "svizzera", "swiss"],
+    "France": ["fr"],
+    "Germany": ["de", "allemagne", "deutschland"],
+    "Luxembourg": ["lu", "lux"],
+    "Jersey": [], "Guernsey": [], "Monaco": [], "Liechtenstein": [], "Israel": [],
+    "Cayman Islands": ["cayman", "iles caimans", "caimans"],
+    "Bermuda": ["bermudes"],
+    "Ireland": ["irlande", "ie"],
+    "Netherlands": ["pays bas", "holland", "hollande", "nl"],
+    "Italy": ["italie"], "Spain": ["espagne"], "Sweden": ["suede"], "Norway": ["norvege"],
+    "Denmark": ["danemark"], "Austria": ["autriche"], "Belgium": ["belgique"],
+    "Singapore": ["singapour", "sg"], "Hong Kong": ["hk"], "Japan": ["japon", "jp"],
+    "China": ["chine"], "India": ["inde"], "South Korea": ["korea", "coree du sud", "coree"],
+    "Australia": ["australie"], "Canada": ["ca"], "Brazil": ["bresil"],
+    "United Arab Emirates": ["uae", "emirats arabes unis", "dubai", "abu dhabi"],
+}
+_COUNTRY_LOOKUP = {
+    normalize_text(alias): canon
+    for canon, aliases in _COUNTRY_ALIASES_RAW.items() for alias in [canon] + aliases
+}
+
+
+def canonical_country(value):
+    """Canonical English country name for a free-text value ('USA', 'Suisse' ...)."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return _COUNTRY_LOOKUP.get(normalize_text(value), str(value).strip())
+
+
+def interpret_country_query(query):
+    """[(typed term, canonical country or None)] for each comma/semicolon separated term."""
+    terms = [t.strip() for t in _re.split(r"[,;\n]+", query or "") if t.strip()]
+    return [(t, _COUNTRY_LOOKUP.get(normalize_text(t))) for t in terms]
+
+
+def _country_mask(country_series, query):
+    terms = [t for t in _re.split(r"[,;\n]+", query or "") if normalize_text(t)]
+    if not terms:
+        return pd.Series(True, index=country_series.index)
+    norm = country_series.map(normalize_text)
+    mask = pd.Series(False, index=country_series.index)
+    for t in terms:
+        key = normalize_text(t)
+        canon = _COUNTRY_LOOKUP.get(key)
+        if canon:
+            mask |= norm == normalize_text(canon)
+        elif len(key) >= 3:
+            mask |= norm.str.contains(key, regex=False)   # partial match, e.g. "united"
+        else:
+            mask |= norm == key
+    return mask
+
+
+_COLUMN_ALIASES_RAW = {
+    "Manager": ["manager", "name", "firm", "manager name", "firm name", "fund manager", "asset manager",
+                "company", "nom", "gestionnaire", "societe", "societe de gestion", "nom du gestionnaire"],
+    "Strategies": ["strategies", "strategy", "primary strategy", "style", "hedge fund strategy",
+                   "strategie", "style de gestion"],
+    "HQ Country": ["hq country", "country", "headquarters country", "domicile", "manager country",
+                   "pays", "pays du siege", "pays du gestionnaire"],
+    "HQ City": ["hq city", "city", "headquarters", "headquarters city", "location", "ville", "siege"],
+    "AUM (USD m)": ["aum usd m", "aum usd million", "aum", "aum m", "aum millions", "aum usd mn",
+                    "assets under management", "fund size usd m", "size usd m", "encours",
+                    "encours usd m", "encours en millions usd", "actifs sous gestion", "taille", "taille usd m"],
+    "AUM as of": ["aum as of", "as of", "aum date", "date", "date des encours"],
+    "Source": ["source", "sources"],
+    "Notes": ["notes", "note", "comments", "description", "remarques", "commentaires"],
+}
+_COLUMN_LOOKUP = {
+    normalize_text(alias): canon
+    for canon, aliases in _COLUMN_ALIASES_RAW.items() for alias in [canon] + aliases
+}
+
+
+def _parse_number(x):
+    """Float from '78000', '78,000', '78 000,5', "78'000" or $78000; NaN if not a number."""
+    if x is None:
+        return np.nan
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return np.nan if pd.isna(x) else float(x)
+    s = str(x).strip()
+    for junk in ("\u00a0", " ", "'", "$", "USD"):
+        s = s.replace(junk, "")
+    if not s:
+        return np.nan
+    if "," in s and "." in s:
+        s = s.replace(",", "")
+    elif "," in s:
+        head, _, tail = s.rpartition(",")
+        s = (head.replace(",", "") + "." + tail) if len(tail) <= 2 else s.replace(",", "")
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
+
+
+def standardize_manager_universe(df):
+    """Rename the columns to the standard schema (tolerant to common header
+    variants), parse strategies / country / AUM, and validate. Raises
+    ValueError with a readable message if a required column is missing."""
+    rename = {}
+    for col in df.columns:
+        canon = _COLUMN_LOOKUP.get(normalize_text(col))
+        if canon and canon not in rename.values():
+            rename[col] = canon
+    out = df.rename(columns=rename)
+    missing = [c for c in MANAGER_REQUIRED_COLUMNS if c not in out.columns]
+    if missing:
+        raise ValueError(
+            f"Missing column(s): {', '.join(missing)}. Required columns: "
+            f"{', '.join(MANAGER_REQUIRED_COLUMNS)} (optional: {', '.join(MANAGER_OPTIONAL_COLUMNS)}). "
+            f"Columns found: {', '.join(map(str, df.columns))}."
+        )
+    for opt in MANAGER_OPTIONAL_COLUMNS:
+        if opt not in out.columns:
+            out[opt] = ""
+    out = out[MANAGER_REQUIRED_COLUMNS + MANAGER_OPTIONAL_COLUMNS].dropna(subset=["Manager"]).copy()
+    out["Manager"] = out["Manager"].astype(str).str.strip()
+    out = out[~out["Manager"].str.lower().isin(["", "nan"])]
+    out["Strategies"] = out["Strategies"].map(parse_strategies)
+    out.insert(2, "Primary Strategy", out["Strategies"].map(lambda s: s[0] if s else ""))
+    out["HQ Country"] = out["HQ Country"].map(canonical_country)
+    out["AUM (USD m)"] = out["AUM (USD m)"].map(_parse_number)
+    for c in MANAGER_OPTIONAL_COLUMNS:
+        out[c] = out[c].fillna("").astype(str).str.strip()
+    return out.reset_index(drop=True)
+
+
+def load_manager_universe(source):
+    """Read a manager universe from a CSV path or file-like object (comma- or
+    semicolon-separated, UTF-8 or Latin-1) and standardize it."""
+    raw = source.read() if hasattr(source, "read") else open(source, "rb").read()
+    if isinstance(raw, str):
+        text = raw
+    else:
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("latin-1")
+    try:
+        df = pd.read_csv(_io.StringIO(text))
+        if df.shape[1] == 1:                       # probably a ';' separated export
+            df = pd.read_csv(_io.StringIO(text), sep=None, engine="python")
+    except Exception as exc:
+        raise ValueError(f"Could not read the file as a CSV table ({exc}).")
+    return standardize_manager_universe(df)
+
+
+def manager_universe_to_csv(universe):
+    """CSV bytes of a standardized universe (strategies joined with ' | ')."""
+    out = universe.copy()
+    out["Strategies"] = out["Strategies"].map(lambda tags: " | ".join(tags))
+    cols = [c for c in MANAGER_REQUIRED_COLUMNS + MANAGER_OPTIONAL_COLUMNS if c in out.columns]
+    return out[cols].to_csv(index=False).encode("utf-8")
+
+
+def manager_strategy_options(universe):
+    """Taxonomy first, then any extra strategy label found in the data."""
+    extras = sorted({t for tags in universe["Strategies"] for t in tags} - set(MANAGER_STRATEGIES))
+    return MANAGER_STRATEGIES + extras
+
+
+def search_managers(universe, strategies=None, country_query="", min_aum_musd=0):
+    """Screen a standardized manager universe.
+    - strategies: keep managers carrying AT LEAST ONE of these tags (empty = all)
+    - country_query: free text, comma separated; matches the HQ country
+      through FR/EN aliases ("UK", "Suisse", "États-Unis") or a partial name
+    - min_aum_musd: minimum hedge fund AUM in USD millions (unknown AUM excluded when > 0)
+    Sorted by AUM, largest first."""
+    mask = pd.Series(True, index=universe.index)
+    if strategies:
+        wanted = set(strategies)
+        mask &= universe["Strategies"].map(lambda tags: bool(wanted & set(tags)))
+    mask &= _country_mask(universe["HQ Country"], country_query)
+    if min_aum_musd and min_aum_musd > 0:
+        mask &= universe["AUM (USD m)"].fillna(-1) >= min_aum_musd
+    return (universe[mask].sort_values("AUM (USD m)", ascending=False, na_position="last")
+            .reset_index(drop=True))
+
+
+_SEED_SOURCE = ("With Intelligence Billion Dollar Club - hedge fund AUM at 30 Jun 2025, "
+                "via https://altss.com/rankings/largest-hedge-funds")
+# The 20 largest hedge fund managers by NET HEDGE FUND ASSETS (USD millions),
+# transcribed from the source above. Strategy tags are the app author's
+# indicative classification of the style given by the source (HFR-style
+# taxonomy), NOT an official provider tag. Four rows are the hedge fund
+# sleeve of a much larger long-only firm (BlackRock, Goldman Sachs AM,
+# Wellington, PIMCO).
+SEED_MANAGER_ROWS = [
+    ("Bridgewater Associates", ["Global Macro", "Quantitative / Systematic"], "Westport", "United States", 78000, "Macro and risk-parity"),
+    ("AQR Capital Management", ["Quantitative / Systematic"], "Greenwich", "United States", 77600, "Systematic, factor-based"),
+    ("Millennium Management", ["Multi-Strategy"], "New York", "United States", 77500, "Multi-manager platform"),
+    ("Elliott Management", ["Event Driven"], "West Palm Beach", "United States", 76100, "Activist, distressed and multi-strategy"),
+    ("TCI Fund Management", ["Event Driven", "Equity Hedge"], "London", "United Kingdom", 70000, "Concentrated, long-biased activist equity"),
+    ("Man Group", ["Quantitative / Systematic", "Managed Futures / CTA", "Equity Hedge"], "London", "United Kingdom", 66500, "Listed manager: AHL (systematic trend), GLG (discretionary), Numeric (quant equity)"),
+    ("Citadel", ["Multi-Strategy"], "Miami", "United States", 66000, "Multi-strategy"),
+    ("D.E. Shaw & Co.", ["Quantitative / Systematic", "Global Macro"], "New York", "United States", 65800, "Quantitative plus discretionary macro"),
+    ("Two Sigma", ["Quantitative / Systematic"], "New York", "United States", 64800, "Quantitative, data-driven"),
+    ("BlackRock", ["Multi-Strategy", "Quantitative / Systematic"], "New York", "United States", 55800, "Hedge fund sleeve of a larger long-only firm (systematic and fundamental)"),
+    ("Adage Capital Management", ["Equity Hedge"], "Boston", "United States", 49000, "Fundamental long/short equity"),
+    ("Goldman Sachs Asset Management", ["Multi-Strategy", "Credit", "Global Macro"], "New York", "United States", 48000, "Hedge fund sleeve of a larger firm (multi-strategy, credit, macro)"),
+    ("Renaissance Technologies", ["Quantitative / Systematic"], "East Setauket", "United States", 46000, "Quantitative"),
+    ("Marshall Wace", ["Equity Hedge", "Quantitative / Systematic"], "London", "United Kingdom", 43000, "Equity long/short and systematic"),
+    ("Point72", ["Multi-Strategy", "Equity Hedge", "Quantitative / Systematic"], "Stamford", "United States", 37700, "Multi-strategy with discretionary and systematic books"),
+    ("Wellington Management", ["Multi-Strategy"], "Boston", "United States", 36400, "Hedge and alternatives sleeve of a larger long-only firm"),
+    ("Viking Global Investors", ["Equity Hedge"], "Greenwich", "United States", 36000, "Fundamental long/short equity"),
+    ("Davidson Kempner", ["Event Driven", "Credit"], "New York", "United States", 35600, "Credit-oriented: distressed, event-driven, merger arbitrage"),
+    ("Farallon Capital", ["Event Driven", "Multi-Strategy"], "San Francisco", "United States", 35600, "Multi-strategy and event-driven"),
+    ("PIMCO", ["Credit", "Global Macro", "Relative Value"], "Newport Beach", "United States", 32200, "Hedge fund sleeve of a larger fixed income firm (credit, macro, relative value)"),
+]
+
+
+def seed_manager_universe():
+    """Built-in sample universe: the 20 largest hedge fund managers (see above)."""
+    rows = [
+        {"Manager": m, "Strategies": s, "HQ City": city, "HQ Country": country, "AUM (USD m)": aum,
+         "AUM as of": "2025-06-30", "Source": _SEED_SOURCE, "Notes": note}
+        for m, s, city, country, aum, note in SEED_MANAGER_ROWS
+    ]
+    return standardize_manager_universe(pd.DataFrame(rows))
