@@ -1261,3 +1261,66 @@ def seed_manager_universe():
         for m, s, city, country, aum, note in SEED_MANAGER_ROWS
     ]
     return standardize_manager_universe(pd.DataFrame(rows))
+
+
+# ---------------------------------------------------------------------
+# Out-of-sample portfolio statistics (daily returns, 1-month VaR / ES)
+# ---------------------------------------------------------------------
+TRADING_DAYS_PER_MONTH = 21
+
+
+def horizon_var_es(returns, horizon_days=TRADING_DAYS_PER_MONTH, alpha=0.05, method="sqrt_time"):
+    """VaR and Expected Shortfall (as negative returns) over `horizon_days`
+    from a series of DAILY returns. Two methods:
+    - "sqrt_time": historical daily VaR / ES, with the mean scaled linearly
+      and the deviation from the mean scaled by the square root of time
+      (VaR_h = h*mu + sqrt(h)*(q - mu)). Works on short samples, but assumes
+      independent daily returns.
+    - "overlapping": historical quantile of overlapping `horizon_days`
+      compounded returns. No scaling assumption, but heavily overlapping and
+      needs at least ~40 days of history (NaN below).
+    ES is the average of the returns at or below the VaR quantile."""
+    r = returns.dropna()
+    if len(r) < 2:
+        return np.nan, np.nan
+    h = horizon_days
+    if method == "overlapping":
+        if len(r) < h + 19:
+            return np.nan, np.nan
+        comp = np.expm1(np.log1p(r).rolling(h).sum().dropna())
+        q = comp.quantile(alpha)
+        return q, comp[comp <= q].mean()
+    if method != "sqrt_time":
+        raise ValueError(f"Unknown method: {method}")
+    mu = r.mean()
+    q = r.quantile(alpha)
+    es = r[r <= q].mean()
+    return h * mu + np.sqrt(h) * (q - mu), h * mu + np.sqrt(h) * (es - mu)
+
+
+def oos_portfolio_stats(returns_df, risk_free_rate=0.0, horizon_days=TRADING_DAYS_PER_MONTH,
+                        method="sqrt_time", trading_days=252):
+    """Return / risk statistics for daily out-of-sample return series (one
+    column per portfolio). Annualization is linear, like the rest of the
+    app: return = mean x 252, variance = daily variance x 252. Sharpe =
+    (annualized return - risk-free rate) / annualized volatility, where the
+    risk-free rate is an annual decimal."""
+    rows = {}
+    for col in returns_df.columns:
+        r = returns_df[col].dropna()
+        if len(r) < 2:
+            continue
+        ann_ret = r.mean() * trading_days
+        ann_var = r.var(ddof=1) * trading_days
+        ann_vol = np.sqrt(ann_var)
+        var_h, es_h = horizon_var_es(r, horizon_days, method=method)
+        rows[col] = {
+            "Observations (days)": len(r),
+            "Annualized Return": ann_ret,
+            "Annualized Variance": ann_var,
+            "Annualized Volatility": ann_vol,
+            "Monthly VaR 95%": var_h,
+            "Monthly Expected Shortfall 95%": es_h,
+            "Sharpe Ratio": (ann_ret - risk_free_rate) / ann_vol if ann_vol > 0 else np.nan,
+        }
+    return pd.DataFrame(rows).T
