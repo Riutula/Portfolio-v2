@@ -367,6 +367,49 @@ with tab_oos:
         fig.update_layout(yaxis_tickformat=",.0%", yaxis_title="Cumulative performance", legend_title="")
         st.plotly_chart(fig, use_container_width=True)
 
+        st.markdown("**Out-of-sample portfolio statistics**")
+        var_method_label = st.radio(
+            "Monthly VaR / Expected Shortfall method",
+            ["Square-root-of-time (from daily history)", "Overlapping 21-day returns"],
+            horizontal=True, key="oos_var_method",
+            help="Square-root-of-time scales the daily distribution to one month (21 trading days) and "
+                 "works on short histories. Overlapping 21-day returns reads the 5% tail of rolling "
+                 "monthly returns directly (no scaling assumption) but needs at least ~40 days.",
+        )
+        var_method = "overlapping" if var_method_label.startswith("Overlapping") else "sqrt_time"
+        oos_stats = lib.oos_portfolio_stats(comp, risk_free_rate, method=var_method)
+        st.session_state["oos_stats"] = oos_stats
+
+        if oos_stats.empty:
+            st.info("Not enough out-of-sample observations to compute statistics.")
+        else:
+            st.dataframe(
+                oos_stats.style.format({
+                    "Observations (days)": "{:.0f}", "Annualized Return": "{:.2%}",
+                    "Annualized Variance": "{:.4f}", "Annualized Volatility": "{:.2%}",
+                    "Monthly VaR 95%": "{:.2%}", "Monthly Expected Shortfall 95%": "{:.2%}",
+                    "Sharpe Ratio": "{:.2f}",
+                }, na_rep="n/a"),
+                use_container_width=True,
+            )
+            _n_days = int(oos_stats["Observations (days)"].min())
+            if _n_days < 60:
+                st.warning(
+                    f"Only {_n_days} days of out-of-sample history: annualized figures and the 5% tail "
+                    f"(VaR / Expected Shortfall) are very noisy. Read them as indicative."
+                )
+            if oos_stats["Monthly VaR 95%"].isna().any():
+                st.info("The overlapping-returns method needs at least ~40 days of history: switch to "
+                        "square-root-of-time or widen the date range.")
+            st.caption(
+                "Daily out-of-sample returns, annualized linearly: return = mean x 252, variance = daily "
+                "variance x 252 (volatility = its square root). Sharpe = (annualized return - average US "
+                "3-month T-bill rate over the loaded period) / annualized volatility. 'Monthly' means 21 "
+                "trading days; VaR and Expected Shortfall are returns at the 95% level (negative = loss), "
+                "ES being the average return in the worst 5% of cases. MSCI World is shown over the same "
+                "dates for reference."
+            )
+
         st.markdown("**Evolution of out-of-sample weights**")
         col1, col2, col3 = st.columns(3)
         with col1:
