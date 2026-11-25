@@ -14,6 +14,7 @@ front-end (`app.py`).
 - **Assets** — price history, cumulative performance, and per-asset
   statistics (annualized return/volatility, VaR, Expected Shortfall) for a
   configurable universe, converted to a common base currency (CHF).
+- **Fundamentals** — bottom-up company analysis for any ticker: ratios recomputed from Yahoo's annual financial statements (margins, ROE/ROIC, growth, leverage, cash conversion, valuation multiples), quality and risk screens (Piotroski F-score, Altman Z/Z'', Beneish M-score, Greenblatt Magic Formula inputs), and a side-by-side comparison of the universe with a quality-vs-cheapness chart. The market cap is converted into the statements' currency first (e.g. a pence-quoted stock reporting in USD). Yahoo data is not point-in-time, so this tab is deliberately kept out of the backtests.
 - **Portfolio Construction** — in-sample Mean-Variance (max Sharpe),
   Minimum-Variance, and Equally-Weighted portfolios, compared against a
   composite benchmark built from the Mean-Variance portfolio's actual
@@ -22,6 +23,7 @@ front-end (`app.py`).
   Equally-Weighted) that invest at each rebalance date and let weights
   drift (buy-and-hold) until the next one, compared against MSCI World with
   performance rebased to a common starting point.
+  The out-of-sample tab also shows a statistics table for the three rolling portfolios and MSCI World (annualized return, annualized variance and volatility, monthly VaR 95%, monthly Expected Shortfall 95%, Sharpe ratio). Monthly = 21 trading days, estimated either by square-root-of-time scaling of the daily history or from overlapping 21-day returns.
 - **Optimization** — grid search over lookback window and rebalance
   frequency, with a 3D scatter colored by excess return vs. MSCI World, and
   a robustness view that tests each combination across several
@@ -31,7 +33,8 @@ front-end (`app.py`).
   scores the client into one of 5 risk categories, each mapped to a blend
   of the Minimum-Variance and Mean-Variance portfolios' most robust,
   latest out-of-sample weights.
-- **Hedge Funds** — has two sub-tabs. Manager search screens hedge fund managers by strategy, country of the manager (free text, English or French: `UK`, `Suisse`, `États-Unis`) and a minimum size slider (USD million). The built-in sample is the 20 largest managers by hedge fund assets (With Intelligence, 30 Jun 2025, via Altss) with an indicative strategy classification; upload your own universe as a CSV (Preqin / HFR / internal export, English or French headers) to screen a broader market. Proxy analytics — monthly-return analytics for liquid Yahoo-listed proxies of four hedge fund strategies (FTLS Equity Hedge, PSH.L Value/Activist, AEDNX Event Driven, QAI Multi-Strategy; any other ticker can be added), in USD against MSCI World: drawdowns, Sortino/Calmar, skewness and kurtosis, Cornish-Fisher VaR, upside/downside capture, beta/alpha, a return-smoothing check (autocorrelation + Geltner unsmoothing), correlations and rolling correlation. These are proxies, not the private funds.
+- **Hedge Funds** has two sub-tabs. *Manager search* screens hedge fund managers by strategy, country of the manager (free text, English or French: `UK`, `Suisse`, `États-Unis`) and a minimum size slider (USD million). The built-in sample is the 20 largest managers by hedge fund assets (With Intelligence, 30 Jun 2025, via Altss) with an indicative strategy classification; upload your own universe as a CSV (Preqin / HFR / internal export, English or French headers) to screen a broader market. *Proxy analytics* — monthly-return analytics for liquid Yahoo-listed *proxies* of four hedge fund strategies (FTLS Equity Hedge, PSH.L Value/Activist, AEDNX Event Driven, QAI Multi-Strategy; any other ticker can be added), in USD against MSCI World: drawdowns, Sortino/Calmar, skewness and kurtosis, Cornish-Fisher VaR, upside/downside capture, beta/alpha, a return-smoothing check (autocorrelation + Geltner unsmoothing), correlations and rolling correlation. These are proxies, not the private funds.
+- **Raw Data** — CSV export of prices and returns.
 
 ## Project structure
 
@@ -79,6 +82,7 @@ python tests/test_app_e2e.py   # full app smoke test (stubbed Streamlit)
 
 ## Notes
 
+- Any Yahoo Finance ticker can be typed into the Universe bar (the currency is detected automatically). Listings quoted in a minor unit - London stocks in pence (`GBp`) - are rescaled before the FX conversion; `DGE.L` is a default ticker handled this way (`DEFAULT_PRICE_SCALE`).
 - All prices are converted to CHF; edit `DEFAULT_CURRENCY_MAP` in
   `portfolio_lib.py` to change the base currency mapping or universe.
 - The Optimization and Client tabs share a single default parameter grid
