@@ -1324,3 +1324,461 @@ def oos_portfolio_stats(returns_df, risk_free_rate=0.0, horizon_days=TRADING_DAY
             "Sharpe Ratio": (ann_ret - risk_free_rate) / ann_vol if ann_vol > 0 else np.nan,
         }
     return pd.DataFrame(rows).T
+
+
+# ---------------------------------------------------------------------
+# Company fundamentals (bottom-up): statements, ratios, quality scores
+# ---------------------------------------------------------------------
+# Yahoo's row labels differ between versions and companies, so every item is
+# looked up through a list of candidate labels (accent/case-insensitive).
+_STATEMENT_LABELS = {
+    "Revenue": ("income", ["Total Revenue", "Operating Revenue", "Revenue"]),
+    "GrossProfit": ("income", ["Gross Profit"]),
+    "EBIT": ("income", ["Operating Income", "EBIT"]),
+    "EBITDA": ("income", ["EBITDA", "Normalized EBITDA"]),
+    "NetIncome": ("income", ["Net Income", "Net Income Common Stockholders",
+                             "Net Income From Continuing Operation Net Minority Interest"]),
+    "InterestExpense": ("income", ["Interest Expense", "Interest Expense Non Operating"]),
+    "PretaxIncome": ("income", ["Pretax Income"]),
+    "TaxProvision": ("income", ["Tax Provision", "Income Tax Expense"]),
+    "SGA": ("income", ["Selling General And Administration", "Selling General Administrative",
+                       "General And Administrative Expense"]),
+    "DepAmortIncome": ("income", ["Reconciled Depreciation", "Depreciation And Amortization In Income Statement"]),
+    "TotalAssets": ("balance", ["Total Assets"]),
+    "CurrentAssets": ("balance", ["Current Assets", "Total Current Assets"]),
+    "CurrentLiabilities": ("balance", ["Current Liabilities", "Total Current Liabilities"]),
+    "TotalLiabilities": ("balance", ["Total Liabilities Net Minority Interest", "Total Liabilities"]),
+    "LongTermDebt": ("balance", ["Long Term Debt", "Long Term Debt And Capital Lease Obligation"]),
+    "TotalDebt": ("balance", ["Total Debt"]),
+    "Cash": ("balance", ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"]),
+    "Equity": ("balance", ["Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"]),
+    "RetainedEarnings": ("balance", ["Retained Earnings"]),
+    "Receivables": ("balance", ["Accounts Receivable", "Receivables", "Net Receivable"]),
+    "PPE": ("balance", ["Net PPE", "Property Plant Equipment Net"]),
+    "Shares": ("balance", ["Ordinary Shares Number", "Share Issued"]),
+    "OperatingCashFlow": ("cash", ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"]),
+    "CapEx": ("cash", ["Capital Expenditure"]),
+    "FreeCashFlow": ("cash", ["Free Cash Flow"]),
+    "DepAmort": ("cash", ["Depreciation And Amortization", "Depreciation Amortization Depletion", "Depreciation"]),
+}
+_STD_COLUMNS = list(_STATEMENT_LABELS) + [
+    "NetDebt", "InvestedCapital", "WorkingCapital", "TaxRate",
+]
+
+
+def _pick_row(df, labels):
+    """First matching row of a statement as a numeric Series (None if absent)."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    lookup = {normalize_text(i): i for i in df.index}
+    for lab in labels:
+        key = normalize_text(lab)
+        if key in lookup:
+            row = df.loc[lookup[key]]
+            if isinstance(row, pd.DataFrame):          # duplicated label
+                row = row.iloc[0]
+            return pd.to_numeric(row, errors="coerce")
+    return None
+
+
+def standardize_statements(income, balance, cash, max_periods=5):
+    """Yahoo statements (rows = items, columns = period ends) -> one DataFrame
+    indexed by fiscal period end (oldest first) with standard column names.
+    Missing items stay NaN; derived items (EBITDA, free cash flow, net debt,
+    invested capital...) are filled from their components when absent."""
+    frames = {"income": income, "balance": balance, "cash": cash}
+    series = {}
+    for key, (stmt, labels) in _STATEMENT_LABELS.items():
+        s = _pick_row(frames[stmt], labels)
+        if s is not None:
+            s = s.copy()
+            s.index = pd.to_datetime(s.index, errors="coerce")
+            series[key] = s[~s.index.isna()]
+    if not series:
+        return pd.DataFrame()
+    std = pd.DataFrame(series).sort_index()
+    for col in _STD_COLUMNS:
+        if col not in std.columns:
+            std[col] = np.nan
+    std["DepAmort"] = std["DepAmort"].fillna(std["DepAmortIncome"])
+    std["EBITDA"] = std["EBITDA"].fillna(std["EBIT"] + std["DepAmort"])
+    std["FreeCashFlow"] = std["FreeCashFlow"].fillna(std["OperatingCashFlow"] - std["CapEx"].abs())
+    std["TotalDebt"] = std["TotalDebt"].fillna(std["LongTermDebt"])
+    std["NetDebt"] = std["TotalDebt"] - std["Cash"]
+    std["InvestedCapital"] = std["Equity"] + std["TotalDebt"] - std["Cash"]
+    std["WorkingCapital"] = std["CurrentAssets"] - std["CurrentLiabilities"]
+    tax = (std["TaxProvision"] / std["PretaxIncome"]).where(std["PretaxIncome"] > 0)
+    std["TaxRate"] = tax.clip(0, 0.4).fillna(0.25)
+    std = std[std[["Revenue", "TotalAssets"]].notna().any(axis=1)]
+    return std.tail(max_periods)
+
+
+def _safe_div(a, b):
+    return a / b.where(b != 0)
+
+
+def fundamental_ratios(std):
+    """Per-year profitability, growth, leverage and cash-flow ratios from a
+    standardized statement table. All are currency-free."""
+    r = pd.DataFrame(index=std.index)
+    r["Gross Margin"] = _safe_div(std["GrossProfit"], std["Revenue"])
+    r["EBIT Margin"] = _safe_div(std["EBIT"], std["Revenue"])
+    r["EBITDA Margin"] = _safe_div(std["EBITDA"], std["Revenue"])
+    r["Net Margin"] = _safe_div(std["NetIncome"], std["Revenue"])
+    r["FCF Margin"] = _safe_div(std["FreeCashFlow"], std["Revenue"])
+    r["ROE"] = _safe_div(std["NetIncome"], std["Equity"].where(std["Equity"] > 0))
+    r["ROA"] = _safe_div(std["NetIncome"], std["TotalAssets"])
+    nopat = std["EBIT"] * (1 - std["TaxRate"])
+    r["ROIC"] = _safe_div(nopat, std["InvestedCapital"].where(std["InvestedCapital"] > 0))
+    for name, col in [("Revenue Growth", "Revenue"), ("EBIT Growth", "EBIT"), ("Net Income Growth", "NetIncome")]:
+        prev = std[col].shift(1)
+        r[name] = (std[col] / prev.where(prev > 0)) - 1
+    r["Net Debt / EBITDA"] = _safe_div(std["NetDebt"], std["EBITDA"].where(std["EBITDA"] > 0))
+    r["Interest Coverage"] = _safe_div(std["EBIT"], std["InterestExpense"].abs())
+    r["Current Ratio"] = _safe_div(std["CurrentAssets"], std["CurrentLiabilities"])
+    r["Debt / Equity"] = _safe_div(std["TotalDebt"], std["Equity"].where(std["Equity"] > 0))
+    r["FCF Conversion"] = _safe_div(std["FreeCashFlow"], std["NetIncome"].where(std["NetIncome"] > 0))
+    r["Asset Turnover"] = _safe_div(std["Revenue"], std["TotalAssets"])
+    r["Accruals"] = _safe_div(std["NetIncome"] - std["OperatingCashFlow"], std["TotalAssets"])
+    return r
+
+
+def cagr(series):
+    """Compound annual growth between the first and last non-null values (one
+    step per period); NaN if fewer than 2 points or a non-positive endpoint."""
+    s = series.dropna()
+    if len(s) < 2 or s.iloc[0] <= 0 or s.iloc[-1] <= 0:
+        return np.nan
+    return (s.iloc[-1] / s.iloc[0]) ** (1 / (len(s) - 1)) - 1
+
+
+def _ok(*values):
+    return all(v is not None and not pd.isna(v) for v in values)
+
+
+def _cmp(a, b, op):
+    return bool(op(a, b)) if _ok(a, b) else None
+
+
+def piotroski_fscore(std):
+    """Piotroski F-score (0-9): nine pass/fail tests of profitability,
+    balance-sheet strength and operating efficiency, last year vs the year
+    before. Returns {'score', 'available', 'tests'}; a test with missing
+    inputs is None and is not counted."""
+    import operator as op
+    group_a, group_b, group_c = "Profitability", "Leverage, liquidity, dilution", "Operating efficiency"
+    if len(std) < 2:
+        tests = [(n, g, None) for n, g in [
+            ("Positive return on assets", group_a), ("Positive operating cash flow", group_a),
+            ("Return on assets improving", group_a), ("Cash flow above net income", group_a),
+            ("Long-term leverage falling", group_b), ("Current ratio improving", group_b),
+            ("No new shares issued", group_b), ("Gross margin improving", group_c),
+            ("Asset turnover improving", group_c)]]
+    else:
+        t, p = std.iloc[-1], std.iloc[-2]
+        roa = lambda x: x["NetIncome"] / x["TotalAssets"] if _ok(x["TotalAssets"]) and x["TotalAssets"] > 0 else np.nan
+        ltd = lambda x: x["LongTermDebt"] if _ok(x["LongTermDebt"]) else x["TotalDebt"]
+        lev = lambda x: ltd(x) / x["TotalAssets"] if _ok(ltd(x), x["TotalAssets"]) and x["TotalAssets"] > 0 else np.nan
+        cr = lambda x: x["CurrentAssets"] / x["CurrentLiabilities"] if _ok(x["CurrentLiabilities"]) and x["CurrentLiabilities"] > 0 else np.nan
+        gm = lambda x: x["GrossProfit"] / x["Revenue"] if _ok(x["Revenue"]) and x["Revenue"] > 0 else np.nan
+        at = lambda x: x["Revenue"] / x["TotalAssets"] if _ok(x["TotalAssets"]) and x["TotalAssets"] > 0 else np.nan
+        tests = [
+            ("Positive return on assets", group_a, _cmp(roa(t), 0, op.gt)),
+            ("Positive operating cash flow", group_a, _cmp(t["OperatingCashFlow"], 0, op.gt)),
+            ("Return on assets improving", group_a, _cmp(roa(t), roa(p), op.gt)),
+            ("Cash flow above net income", group_a, _cmp(t["OperatingCashFlow"], t["NetIncome"], op.gt)),
+            ("Long-term leverage falling", group_b, _cmp(lev(t), lev(p), op.lt)),
+            ("Current ratio improving", group_b, _cmp(cr(t), cr(p), op.gt)),
+            ("No new shares issued", group_b, _cmp(t["Shares"], p["Shares"] * 1.005, op.le)),
+            ("Gross margin improving", group_c, _cmp(gm(t), gm(p), op.gt)),
+            ("Asset turnover improving", group_c, _cmp(at(t), at(p), op.gt)),
+        ]
+    table = pd.DataFrame(tests, columns=["Test", "Group", "Result"])
+    return {"score": int(sum(r is True for r in table["Result"])),
+            "available": int(sum(r is not None for r in table["Result"])),
+            "tests": table}
+
+
+def altman_z_scores(std, market_cap=None):
+    """Altman Z (public manufacturers; needs the market cap) and Z'' (works for
+    non-manufacturers, book-value based). Zones: Z safe > 2.99, distress < 1.81;
+    Z'' safe > 2.60, distress < 1.10. NOT meaningful for banks or insurers."""
+    nan = np.nan
+    out = {"Z": nan, "Zone": "n/a", "Z''": nan, "Zone''": "n/a", "components": {}}
+    if std.empty:
+        return out
+    x = std.iloc[-1]
+    ta = x["TotalAssets"]
+    if not _ok(ta) or ta <= 0:
+        return out
+    x1 = x["WorkingCapital"] / ta
+    x2 = x["RetainedEarnings"] / ta
+    x3 = x["EBIT"] / ta
+    x5 = x["Revenue"] / ta
+    tl = x["TotalLiabilities"]
+    x4_book = x["Equity"] / tl if _ok(tl) and tl > 0 else nan
+    x4_mkt = market_cap / tl if _ok(market_cap, tl) and tl > 0 else nan
+    out["components"] = {"X1 working capital / assets": x1, "X2 retained earnings / assets": x2,
+                         "X3 EBIT / assets": x3, "X4 market cap / liabilities": x4_mkt,
+                         "X4' book equity / liabilities": x4_book, "X5 sales / assets": x5}
+    if _ok(x1, x2, x3, x4_mkt, x5):
+        z = 1.2 * x1 + 1.4 * x2 + 3.3 * x3 + 0.6 * x4_mkt + 1.0 * x5
+        out["Z"], out["Zone"] = z, ("Safe" if z > 2.99 else "Grey" if z >= 1.81 else "Distress")
+    if _ok(x1, x2, x3, x4_book):
+        zd = 6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4_book
+        out["Z''"], out["Zone''"] = zd, ("Safe" if zd > 2.6 else "Grey" if zd >= 1.1 else "Distress")
+    return out
+
+
+def beneish_m_score(std, threshold=-1.78):
+    """Beneish M-score (8 variables, last year vs the year before): a screen
+    for earnings manipulation. M above -1.78 is a warning sign, not proof.
+    NaN (with the list of missing inputs) when an input is unavailable.
+    NOT meaningful for banks or insurers."""
+    out = {"M": np.nan, "flag": None, "components": {}, "missing": [], "threshold": threshold}
+    if len(std) < 2:
+        out["missing"] = ["needs two annual periods"]
+        return out
+    t, p = std.iloc[-1], std.iloc[-2]
+
+    def ratio(a, b):
+        return a / b if _ok(a, b) and b != 0 else np.nan
+
+    gm_t, gm_p = ratio(t["GrossProfit"], t["Revenue"]), ratio(p["GrossProfit"], p["Revenue"])
+    aq = lambda x: 1 - ratio(x["CurrentAssets"] + x["PPE"], x["TotalAssets"])
+    dep = lambda x: ratio(x["DepAmort"], x["DepAmort"] + x["PPE"])
+    lv = lambda x: ratio(x["CurrentLiabilities"] + (x["LongTermDebt"] if _ok(x["LongTermDebt"]) else x["TotalDebt"]),
+                         x["TotalAssets"])
+    comps = {
+        "DSRI": ratio(ratio(t["Receivables"], t["Revenue"]), ratio(p["Receivables"], p["Revenue"])),
+        "GMI": ratio(gm_p, gm_t),
+        "AQI": ratio(aq(t), aq(p)),
+        "SGI": ratio(t["Revenue"], p["Revenue"]),
+        "DEPI": ratio(dep(p), dep(t)),
+        "SGAI": ratio(ratio(t["SGA"], t["Revenue"]), ratio(p["SGA"], p["Revenue"])),
+        "LVGI": ratio(lv(t), lv(p)),
+        "TATA": ratio(t["NetIncome"] - t["OperatingCashFlow"], t["TotalAssets"]),
+    }
+    out["components"] = comps
+    out["missing"] = [k for k, v in comps.items() if not _ok(v)]
+    if not out["missing"]:
+        m = (-4.84 + 0.920 * comps["DSRI"] + 0.528 * comps["GMI"] + 0.404 * comps["AQI"]
+             + 0.892 * comps["SGI"] + 0.115 * comps["DEPI"] - 0.172 * comps["SGAI"]
+             + 4.679 * comps["TATA"] - 0.327 * comps["LVGI"])
+        out["M"], out["flag"] = m, bool(m > threshold)
+    return out
+
+
+def magic_formula_inputs(std, market_cap=None):
+    """Greenblatt's two ratios (simplified): earnings yield = EBIT / enterprise
+    value, and return on capital = EBIT / (net working capital excluding cash
+    + net fixed assets)."""
+    out = {"Earnings Yield": np.nan, "Return on Capital": np.nan}
+    if std.empty:
+        return out
+    x = std.iloc[-1]
+    if _ok(market_cap, x["TotalDebt"], x["Cash"], x["EBIT"]):
+        ev = market_cap + x["TotalDebt"] - x["Cash"]
+        if ev > 0:
+            out["Earnings Yield"] = x["EBIT"] / ev
+    if _ok(x["CurrentAssets"], x["Cash"], x["CurrentLiabilities"], x["PPE"], x["EBIT"]):
+        capital = (x["CurrentAssets"] - x["Cash"] - x["CurrentLiabilities"]) + x["PPE"]
+        if capital > 0:
+            out["Return on Capital"] = x["EBIT"] / capital
+    return out
+
+
+def magic_formula_ranks(table):
+    """Rank companies on earnings yield and return on capital (1 = best each),
+    add the two ranks, and re-rank. `table` is indexed by ticker with columns
+    'Earnings Yield' and 'Return on Capital'; companies missing either are
+    left out (NaN)."""
+    t = table[["Earnings Yield", "Return on Capital"]].dropna()
+    if t.empty:
+        return pd.Series(np.nan, index=table.index)
+    total = t["Earnings Yield"].rank(ascending=False) + t["Return on Capital"].rank(ascending=False)
+    return total.rank(method="min").reindex(table.index)
+
+
+def market_cap_major_units(info):
+    """Market cap in the MAJOR unit of the listing currency (pounds, not
+    pence). For minor-unit listings Yahoo's market cap may be in either unit,
+    so it is compared with price x shares to tell which. None if unavailable."""
+    if not info:
+        return None
+    mc = info.get("marketCap")
+    if mc is None or pd.isna(mc) or mc <= 0:
+        return None
+    _, scale = split_currency_code(info.get("currency"))
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    shares = info.get("sharesOutstanding")
+    if scale != 1.0 and price and shares:
+        implied = price * shares                      # in the minor unit (pence)
+        if abs(mc / implied - 1) < 0.35:
+            return float(mc) * scale
+    return float(mc)
+
+
+def valuation_snapshot(std, market_cap=None, dividend_yield=None):
+    """Valuation multiples on the last fiscal year. `market_cap` must be in the
+    SAME currency as the statements."""
+    nan = np.nan
+    out = {k: nan for k in ["Market Cap", "Enterprise Value", "P/E", "P/B", "P/S", "EV/EBITDA", "EV/EBIT",
+                            "Earnings Yield (EBIT/EV)", "FCF Yield", "Dividend Yield"]}
+    out["Dividend Yield"] = dividend_yield if _ok(dividend_yield) else nan
+    if std.empty or not _ok(market_cap):
+        return out
+    x = std.iloc[-1]
+    out["Market Cap"] = market_cap
+    if _ok(x["NetIncome"]) and x["NetIncome"] > 0:
+        out["P/E"] = market_cap / x["NetIncome"]
+    if _ok(x["Equity"]) and x["Equity"] > 0:
+        out["P/B"] = market_cap / x["Equity"]
+    if _ok(x["Revenue"]) and x["Revenue"] > 0:
+        out["P/S"] = market_cap / x["Revenue"]
+    if _ok(x["FreeCashFlow"]):
+        out["FCF Yield"] = x["FreeCashFlow"] / market_cap
+    if _ok(x["TotalDebt"], x["Cash"]):
+        ev = market_cap + x["TotalDebt"] - x["Cash"]
+        out["Enterprise Value"] = ev
+        if ev > 0:
+            if _ok(x["EBITDA"]) and x["EBITDA"] > 0:
+                out["EV/EBITDA"] = ev / x["EBITDA"]
+            if _ok(x["EBIT"]) and x["EBIT"] > 0:
+                out["EV/EBIT"] = ev / x["EBIT"]
+            if _ok(x["EBIT"]):
+                out["Earnings Yield (EBIT/EV)"] = x["EBIT"] / ev
+    return out
+
+
+def build_company_profile(ticker, income, balance, cash, info=None, fx_to_statement=1.0, notes=None):
+    """Everything the Fundamentals tab shows for one company, from raw Yahoo
+    statements. `fx_to_statement` converts the listing-currency market cap
+    into the statements' currency (None if that rate is unavailable)."""
+    info = info or {}
+    warnings = list(notes or [])
+    std = standardize_statements(income, balance, cash)
+    profile = {"ticker": ticker, "available": False, "message": "", "warnings": warnings,
+               "name": info.get("longName") or info.get("shortName") or ticker,
+               "sector": info.get("sector") or "", "industry": info.get("industry") or "",
+               "listing_currency": split_currency_code(info.get("currency"))[0] or "",
+               "statement_currency": split_currency_code(info.get("financialCurrency"))[0] or ""}
+    if std.empty:
+        profile["message"] = ("No annual financial statements found on Yahoo for this ticker. This is "
+                              "normal for ETFs, funds and indices; otherwise the data is missing.")
+        return profile
+
+    if len(std) < 3:
+        warnings.append(f"Only {len(std)} annual period(s) available: trends and scores are limited.")
+    sector_text = f"{profile['sector']} {profile['industry']}".lower()
+    if any(w in sector_text for w in ("financial", "bank", "insurance")):
+        warnings.append("Banks, insurers and other financials: Altman, Beneish, working-capital based "
+                        "ratios and Piotroski's margin tests are not meaningful for them.")
+    mc_listing = market_cap_major_units(info)
+    if mc_listing is None:
+        warnings.append("Market capitalization unavailable: valuation multiples cannot be computed.")
+    mc_stmt = mc_listing * fx_to_statement if _ok(mc_listing, fx_to_statement) else None
+
+    ratios = fundamental_ratios(std)
+    dy = info.get("trailingAnnualDividendYield")
+    valuation = valuation_snapshot(std, mc_stmt, dy)
+    pio = piotroski_fscore(std)
+    alt = altman_z_scores(std, mc_stmt)
+    ben = beneish_m_score(std)
+    magic = magic_formula_inputs(std, mc_stmt)
+    last = ratios.iloc[-1]
+    summary = {
+        "Name": profile["name"], "Sector": profile["sector"],
+        "P/E": valuation["P/E"], "P/B": valuation["P/B"], "EV/EBITDA": valuation["EV/EBITDA"],
+        "EV/EBIT": valuation["EV/EBIT"], "FCF Yield": valuation["FCF Yield"],
+        "Earnings Yield (EBIT/EV)": valuation["Earnings Yield (EBIT/EV)"],
+        "ROIC": last["ROIC"], "ROE": last["ROE"], "EBIT Margin": last["EBIT Margin"],
+        "Net Margin": last["Net Margin"], "Revenue CAGR": cagr(std["Revenue"]),
+        "Net Debt / EBITDA": last["Net Debt / EBITDA"], "Interest Coverage": last["Interest Coverage"],
+        "Piotroski F-Score": pio["score"], "Piotroski Tests": pio["available"],
+        "Altman Z": alt["Z"], "Altman Zone": alt["Zone"], "Altman Z''": alt["Z''"],
+        "Altman Zone''": alt["Zone''"], "Beneish M": ben["M"], "Beneish Flag": ben["flag"],
+        "Earnings Yield": magic["Earnings Yield"], "Return on Capital": magic["Return on Capital"],
+    }
+    profile.update({"available": True, "std": std, "ratios": ratios, "valuation": valuation,
+                    "piotroski": pio, "altman": alt, "beneish": ben, "magic": magic,
+                    "market_cap_statement_ccy": mc_stmt, "summary": summary})
+    return profile
+
+
+def fetch_statements(ticker):
+    """Annual income statement, balance sheet, cash flow and info for one
+    ticker (empty objects when Yahoo has nothing)."""
+    tk = yf.Ticker(ticker)
+
+    def _get(*names):
+        for n in names:
+            try:
+                df = getattr(tk, n)
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return pd.DataFrame()
+
+    income = _get("income_stmt", "financials")
+    balance = _get("balance_sheet")
+    cash = _get("cashflow", "cash_flow")
+    try:
+        info = tk.info or {}
+    except Exception:
+        info = {}
+    return income, balance, cash, info
+
+
+def fx_rate(from_ccy, to_ccy):
+    """Latest Yahoo rate: units of `to_ccy` per 1 `from_ccy` (None if unavailable)."""
+    if not from_ccy or not to_ccy:
+        return None
+    if from_ccy == to_ccy:
+        return 1.0
+    try:
+        close = yf.download(f"{from_ccy}{to_ccy}=X", period="5d", auto_adjust=True)["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        value = float(close.dropna().iloc[-1])
+        return value if value > 0 else None
+    except Exception:
+        return None
+
+
+def load_company_profile(ticker):
+    """Download and analyse one company (network). The listing-currency market
+    cap is converted into the statements' currency first, so P/E, EV/EBITDA
+    and Altman's X4 never mix currencies (e.g. Diageo: listed in pence,
+    reports in USD)."""
+    income, balance, cash, info = fetch_statements(ticker)
+    listing = split_currency_code(info.get("currency"))[0]
+    reporting = split_currency_code(info.get("financialCurrency"))[0]
+    notes, fx = [], 1.0
+    if listing and reporting and listing != reporting:
+        fx = fx_rate(listing, reporting)
+        if fx is None:
+            notes.append(f"FX rate {listing}{reporting}=X unavailable: valuation multiples cannot be "
+                         f"computed (the stock trades in {listing} but reports in {reporting}).")
+        else:
+            notes.append(f"The stock trades in {listing} but reports in {reporting}: market cap converted "
+                         f"at {fx:.4f} {reporting} per {listing} before computing multiples.")
+    elif not reporting:
+        notes.append("Statement currency unknown: assumed equal to the listing currency.")
+    return build_company_profile(ticker, income, balance, cash, info, fx_to_statement=fx, notes=notes)
+
+
+def compare_profiles(profiles):
+    """One row per available company with the headline metrics and scores,
+    plus the Magic Formula rank across the set."""
+    rows = {t: p["summary"] for t, p in profiles.items() if p.get("available")}
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).T
+    text_cols = {"Name", "Sector", "Altman Zone", "Altman Zone''", "Beneish Flag"}
+    for col in df.columns:
+        if col not in text_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["Magic Formula Rank"] = magic_formula_ranks(df)
+    return df
