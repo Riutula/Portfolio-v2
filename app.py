@@ -129,6 +129,11 @@ def cached_hf_risk_free(years, today_str):
     return lib.average_risk_free_rate(end - pd.DateOffset(years=years), end)
 
 
+@st.cache_data(ttl=3600, show_spinner="Fetching financial statements...")
+def cached_company_profile(ticker):
+    return lib.load_company_profile(ticker)
+
+
 def pct(x, d=2):
     try:
         return f"{x * 100:.{d}f}%"
@@ -223,8 +228,9 @@ asset_info = cached_asset_info(tuple(tickers))
 st.title("📊 Portfolio Dashboard")
 st.caption(f"{len(tickers)} assets • base currency CHF • {start_date} → {end_date}")
 
-tab_assets, tab_construction, tab_oos, tab_optim, tab_client, tab_hf, tab_data = st.tabs(
-    ["Assets", "Portfolio Construction", "Out-of-Sample", "Optimization", "Client", "Hedge Funds", "Raw Data"]
+tab_assets, tab_fund, tab_construction, tab_oos, tab_optim, tab_client, tab_hf, tab_data = st.tabs(
+    ["Assets", "Fundamentals", "Portfolio Construction", "Out-of-Sample", "Optimization", "Client",
+     "Hedge Funds", "Raw Data"]
 )
 
 # ---------------------------------------------------------------------
@@ -876,6 +882,182 @@ with tab_client:
                         f"({longer_window} days) leaves too few trading days after it within the "
                         f"loaded price history. Widen the date range in the sidebar to see this chart."
                     )
+
+# ---------------------------------------------------------------------
+# Tab: Fundamentals (bottom-up company analysis)
+# ---------------------------------------------------------------------
+def _fmt_x(v, d=1):
+    return "n/a" if v is None or pd.isna(v) else f"{v:.{d}f}x"
+
+
+def _fmt_pct(v, d=1):
+    return "n/a" if v is None or pd.isna(v) else f"{v:.{d}%}"
+
+
+_PCT_RATIOS = ["Gross Margin", "EBIT Margin", "EBITDA Margin", "Net Margin", "FCF Margin", "ROE", "ROA",
+               "ROIC", "Revenue Growth", "EBIT Growth", "Net Income Growth", "FCF Conversion", "Accruals"]
+
+with tab_fund:
+    st.subheader("Company fundamentals (bottom-up)")
+    st.caption(
+        "Ratios and quality scores are recomputed from Yahoo Finance's annual financial statements "
+        "(typically about four years). The data is not point-in-time and can be restated or incomplete, so "
+        "this is a research aid, not a source of truth - and it is deliberately kept out of the backtests, "
+        "which it would bias with look-ahead."
+    )
+    fund_choice = st.selectbox(
+        "Company", options=list(tickers), accept_new_options=True, key="fund_ticker",
+        help="A company of your universe, or type any Yahoo Finance ticker.",
+    )
+    fund_ticker = (fund_choice or "").strip().upper()
+    profile = cached_company_profile(fund_ticker) if fund_ticker else None
+
+    if profile is not None:
+        st.session_state["fund_profile"] = profile
+        for w in profile["warnings"]:
+            (st.info if "converted" in w else st.warning)(w)
+        if not profile["available"]:
+            st.info(profile["message"])
+        else:
+            std, ratios, val = profile["std"], profile["ratios"], profile["valuation"]
+            ccy = profile["statement_currency"] or profile["listing_currency"] or ""
+            years = list(std.index.year.astype(str))
+            st.markdown(f"### {profile['name']} ({profile['ticker']})")
+            st.caption(
+                f"{profile['sector'] or 'Sector n/a'} - {profile['industry'] or 'industry n/a'} | statements in "
+                f"{ccy or 'n/a'}, latest fiscal year ended {std.index[-1]:%d %b %Y}. Multiples use that fiscal "
+                f"year (up to 12-15 months old) and today's market cap."
+            )
+            mc = profile["market_cap_statement_ccy"]
+            headline = [
+                (f"Market cap ({ccy or 'n/a'}, bn)", "n/a" if mc is None else f"{mc / 1e9:,.1f}"),
+                ("P/E", _fmt_x(val["P/E"])), ("EV/EBITDA", _fmt_x(val["EV/EBITDA"])),
+                ("FCF yield", _fmt_pct(val["FCF Yield"])), ("ROIC", _fmt_pct(ratios["ROIC"].iloc[-1])),
+                ("Net debt / EBITDA", _fmt_x(ratios["Net Debt / EBITDA"].iloc[-1])),
+            ]
+            for col, (label, value) in zip(st.columns(6), headline):
+                with col:
+                    st.metric(label, value)
+
+            with st.expander("Valuation multiples"):
+                st.dataframe(pd.DataFrame({"Value": {
+                    "P/E": _fmt_x(val["P/E"]), "P/B": _fmt_x(val["P/B"]), "P/S": _fmt_x(val["P/S"]),
+                    "EV/EBITDA": _fmt_x(val["EV/EBITDA"]), "EV/EBIT": _fmt_x(val["EV/EBIT"]),
+                    "Earnings yield (EBIT/EV)": _fmt_pct(val["Earnings Yield (EBIT/EV)"]),
+                    "FCF yield": _fmt_pct(val["FCF Yield"]),
+                    "Dividend yield (trailing)": _fmt_pct(val["Dividend Yield"]),
+                }}), use_container_width=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = go.Figure()
+                fig.add_bar(x=years, y=std["Revenue"] / 1e6, name="Revenue")
+                fig.add_bar(x=years, y=std["NetIncome"] / 1e6, name="Net income")
+                fig.update_layout(barmode="group", title="Revenue and net income",
+                                  yaxis_title=f"{ccy} millions", legend_title="")
+                st.plotly_chart(fig, use_container_width=True)
+            with c2:
+                margins = ratios[["Gross Margin", "EBIT Margin", "Net Margin", "FCF Margin"]].copy()
+                margins.index = years
+                fig = px.line(margins, markers=True, title="Margins")
+                fig.update_layout(yaxis_tickformat=".0%", legend_title="", xaxis_title="")
+                st.plotly_chart(fig, use_container_width=True)
+            c3, c4 = st.columns(2)
+            with c3:
+                roc = ratios[["ROE", "ROIC", "ROA"]].copy()
+                roc.index = years
+                fig = px.line(roc, markers=True, title="Returns on equity, invested capital and assets")
+                fig.update_layout(yaxis_tickformat=".0%", legend_title="", xaxis_title="")
+                st.plotly_chart(fig, use_container_width=True)
+            with c4:
+                fig = go.Figure()
+                fig.add_bar(x=years, y=std["OperatingCashFlow"] / 1e6, name="Operating cash flow")
+                fig.add_bar(x=years, y=std["FreeCashFlow"] / 1e6, name="Free cash flow")
+                fig.add_bar(x=years, y=std["NetIncome"] / 1e6, name="Net income")
+                fig.update_layout(barmode="group", title="Cash flow vs earnings",
+                                  yaxis_title=f"{ccy} millions", legend_title="")
+                st.plotly_chart(fig, use_container_width=True)
+
+            st.markdown("### Quality and risk scores")
+            s1, s2, s3 = st.columns(3)
+            with s1:
+                pio = profile["piotroski"]
+                st.metric("Piotroski F-score", f"{pio['score']} / {pio['available']}" if pio["available"] else "n/a")
+                st.caption("Nine pass/fail tests of profitability, balance-sheet strength and efficiency, last "
+                           "year vs the year before. 8-9 is strong, 0-2 weak.")
+                tests = pio["tests"].copy()
+                tests["Result"] = tests["Result"].map(
+                    lambda v: "✓ pass" if v is True else "✗ fail" if v is False else "n/a")
+                st.dataframe(tests[["Test", "Result"]], use_container_width=True, hide_index=True)
+            with s2:
+                alt = profile["altman"]
+                z2, zone2 = alt["Z''"], alt["Zone''"]
+                st.metric("Altman Z'' (non-manufacturers)", "n/a" if pd.isna(z2) else f"{z2:.2f} ({zone2})")
+                z1, zone1 = alt["Z"], alt["Zone"]
+                st.caption("Distress-risk score: above 2.6 safe, below 1.1 distress. Original Altman Z "
+                           "(manufacturers; above 2.99 safe, below 1.81 distress): "
+                           + ("n/a" if pd.isna(z1) else f"{z1:.2f} ({zone1})") + ".")
+            with s3:
+                ben = profile["beneish"]
+                st.metric("Beneish M-score", "n/a" if pd.isna(ben["M"]) else f"{ben['M']:.2f}")
+                if pd.isna(ben["M"]):
+                    st.caption("Not computed - missing inputs: " + ", ".join(ben["missing"]) + ".")
+                elif ben["flag"]:
+                    st.caption("Above -1.78: warning sign of possible earnings manipulation (a screen, not proof).")
+                else:
+                    st.caption("Below -1.78: no earnings-manipulation warning.")
+                mf = profile["magic"]
+                st.caption(f"Greenblatt Magic Formula inputs - earnings yield: {_fmt_pct(mf['Earnings Yield'])}, "
+                           f"return on capital: {_fmt_pct(mf['Return on Capital'])} (ranked in the comparison below).")
+
+            with st.expander("All ratios by fiscal year"):
+                shown = ratios.T.astype(object)
+                for name in shown.index:
+                    fmt_fn = _fmt_pct if name in _PCT_RATIOS else _fmt_x
+                    shown.loc[name] = [fmt_fn(v, 1 if name in _PCT_RATIOS else 2) for v in ratios[name]]
+                shown.columns = years
+                st.dataframe(shown, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### Compare the companies of your universe")
+    if st.button("Load / refresh the comparison", key="fund_compare_btn"):
+        st.session_state["fund_compare_ran"] = True
+    if st.session_state.get("fund_compare_ran"):
+        with st.spinner("Fetching the statements of every company..."):
+            profs = {t: cached_company_profile(t) for t in tickers}
+        comp_df = lib.compare_profiles(profs)
+        st.session_state["fund_comparison"] = comp_df
+        skipped = [t for t, p in profs.items() if not p["available"]]
+        if skipped:
+            st.caption("No financial statements (funds, ETFs or missing data): " + ", ".join(skipped))
+        if comp_df.empty:
+            st.info("No company with financial statements in the current universe.")
+        else:
+            cols = ["Name", "Sector", "P/E", "EV/EBITDA", "FCF Yield", "Earnings Yield (EBIT/EV)", "ROIC",
+                    "EBIT Margin", "Revenue CAGR", "Net Debt / EBITDA", "Piotroski F-Score", "Altman Zone''",
+                    "Beneish M", "Magic Formula Rank"]
+            display = comp_df[cols].rename(columns={"Altman Zone''": "Altman Z'' zone"})
+            st.dataframe(
+                display.style.format({
+                    "P/E": "{:.1f}x", "EV/EBITDA": "{:.1f}x", "FCF Yield": "{:.1%}",
+                    "Earnings Yield (EBIT/EV)": "{:.1%}", "ROIC": "{:.1%}", "EBIT Margin": "{:.1%}",
+                    "Revenue CAGR": "{:.1%}", "Net Debt / EBITDA": "{:.1f}x", "Piotroski F-Score": "{:.0f}",
+                    "Beneish M": "{:.2f}", "Magic Formula Rank": "{:.0f}",
+                }, na_rep="n/a"),
+                use_container_width=True,
+            )
+            plot_df = comp_df.dropna(subset=["Earnings Yield (EBIT/EV)", "ROIC"])
+            if len(plot_df) >= 2:
+                plot_df = plot_df.reset_index().rename(columns={"index": "Ticker"})
+                fig = px.scatter(plot_df, x="Earnings Yield (EBIT/EV)", y="ROIC", text="Ticker",
+                                 hover_name="Name", title="Quality vs cheapness (top right = high ROIC and high "
+                                                          "earnings yield)")
+                fig.update_traces(textposition="top center")
+                fig.update_layout(xaxis_tickformat=".0%", yaxis_tickformat=".0%")
+                st.plotly_chart(fig, use_container_width=True)
+            st.caption("The Magic Formula rank adds each company's rank on earnings yield and on return on "
+                       "capital (1 = best) within this set only. All figures are currency-free ratios, so "
+                       "companies listed in different currencies can be compared.")
 
 # ---------------------------------------------------------------------
 # Tab: Hedge funds (liquid proxies, monthly analytics)
