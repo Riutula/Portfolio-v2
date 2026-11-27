@@ -22,6 +22,68 @@ import portfolio_lib as lib
 st.set_page_config(page_title="Portfolio Dashboard", layout="wide", page_icon="📊")
 
 # ---------------------------------------------------------------------
+# Version check: app.py and portfolio_lib.py are updated together. If only one
+# of them was replaced (or a stale copy is imported), stop with a readable
+# message instead of an AttributeError deep inside a tab.
+_REQUIRED_LIB_NAMES = (
+    'DEFAULT_CURRENCY_MAP',
+    'DEFAULT_PRICE_SCALE',
+    'DEFAULT_TICKERS',
+    'HEDGE_FUND_BENCHMARK',
+    'HEDGE_FUND_PROXIES',
+    'QUESTIONNAIRE',
+    'QUESTIONNAIRE_MAX_SCORE',
+    'RISK_BLEND',
+    'average_risk_free_rate',
+    'blend_weights',
+    'build_benchmark_composite',
+    'compare_profiles',
+    'compute_correlation_matrix',
+    'compute_returns',
+    'compute_robustness',
+    'compute_summary_stats',
+    'detect_currency_and_scale',
+    'drawdown_series',
+    'equal_weights',
+    'generate_period_slices',
+    'get_asset_info',
+    'hedge_fund_risk_table',
+    'interpret_country_query',
+    'load_company_profile',
+    'load_fx_data',
+    'load_manager_universe',
+    'load_msci_world',
+    'load_prices_chf',
+    'load_prices_usd',
+    'load_risk_free_rate',
+    'manager_strategy_options',
+    'manager_universe_to_csv',
+    'monthly_returns_from_prices',
+    'oos_portfolio_stats',
+    'optimize_grid',
+    'optimize_max_sharpe',
+    'optimize_min_variance',
+    'rebase_to_zero',
+    'rolling_correlation',
+    'rolling_equal_weight',
+    'rolling_mean_variance',
+    'rolling_min_variance',
+    'score_to_risk_category',
+    'search_managers',
+    'seed_manager_universe',
+)
+_missing_lib = [n for n in _REQUIRED_LIB_NAMES if not hasattr(lib, n)]
+if _missing_lib:
+    st.error(
+        "portfolio_lib.py does not match this app.py: it is out of date and lacks "
+        + ", ".join(_missing_lib) + ". The file currently loaded is "
+        + str(getattr(lib, "__file__", "unknown")) + ". Replace it with the latest portfolio_lib.py "
+        "(saved under exactly that name, in the same folder as app.py), then restart the app. On "
+        "Streamlit Cloud: commit the file to GitHub, then reboot the app from the 'Manage app' menu."
+    )
+    st.stop()
+
+# ---------------------------------------------------------------------
 # Single source of truth for the "default" robustness search grid, used both
 # as the Optimization tab's default slider values AND by the Client tab's
 # automatic robust-parameter search (cached_best_params below). Keeping
